@@ -433,14 +433,41 @@ type AdapterCommandName =
   | "bind-expected-user-turn"
   | "cancel-transfer";
 
-type AdapterCommandFailure = {
-  type: "adapter-command-failure";
-  command: AdapterCommandName;
-  sessionId?: string;
-  transferId?: string;
-  waitId?: string;
-  reason: RelayFailureReason;
-};
+type AdapterCommandFailure =
+  | {
+      type: "adapter-command-failure";
+      command: "adapter-inspect";
+      reason: RelayFailureReason;
+    }
+  | {
+      type: "adapter-command-failure";
+      command: "arm-response";
+      sessionId: string;
+      waitId: string;
+      reason: RelayFailureReason;
+    }
+  | {
+      type: "adapter-command-failure";
+      command: "prepare-peer-response" | "commit-transfer";
+      sessionId: string;
+      transferId: string;
+      waitId: string;
+      reason: RelayFailureReason;
+    }
+  | {
+      type: "adapter-command-failure";
+      command: "bind-expected-user-turn";
+      sessionId: string;
+      waitId: string;
+      reason: RelayFailureReason;
+    }
+  | {
+      type: "adapter-command-failure";
+      command: "cancel-transfer";
+      sessionId: string;
+      transferId: string;
+      reason: RelayFailureReason;
+    };
 
 type AdapterInspectRequest = {
   type: "adapter-inspect";
@@ -548,6 +575,7 @@ type CancelTransferMessage = {
 
 type CancelTransferResult = {
   type: "cancel-transfer-result";
+  sessionId: string;
   result: CancelSubmissionResult;
 };
 
@@ -689,13 +717,15 @@ bind-expected-user-turn:
 
 cancel-transfer:
   request includes sessionId + transferId
-  response wraps one exact CancelSubmissionResult variant
+  response includes same sessionId and wraps one exact CancelSubmissionResult variant
   expected = both accepted
 
 adapter-command-failure:
-  response includes command + machine-readable RelayFailureReason
-  optional sessionId/transferId/waitId correlate to the originating command
-  expected = accepted
+  each command variant contains exactly the correlation fields defined by
+  AdapterCommandFailure (inspect none; arm sessionId+waitId; prepare/commit
+  sessionId+transferId+waitId; bind sessionId+waitId; cancel sessionId+transferId)
+  plus machine-readable RelayFailureReason
+  expected = accepted only when required fields are present
 
 relay-status:
   request = {type:"relay-status"}
@@ -1901,7 +1931,7 @@ The concrete transport uses this exact algorithm for every method:
      prepare: sessionId + transferId + waitId
      commit: sessionId + transferId + waitId
      bind: sessionId + waitId
-     cancel: transferId
+     cancel: sessionId + transferId
 7. any correlation mismatch:
      throw RelayTransportError(reason="adapter-transport-failed")
 8. return exact success type
@@ -1942,14 +1972,14 @@ BindExpectedUserTurnMessage
 
 CancelTransferMessage
   -> adapter.cancelSubmission({sessionId, transferId})
-  -> CancelTransferResult
+  -> CancelTransferResult(sessionId=request.sessionId, result=adapter result)
 ```
 
 Content runtime failure serialization is exact:
 - known `RelayDomainError` → `AdapterCommandFailure.reason = error.reason`;
 - any other thrown/rejected adapter exception → `reason = "adapter-command-failed"`;
 - `command` always equals the request command;
-- copy only correlation fields present on the request;
+- construct the exact command-specific `AdapterCommandFailure` variant, including every required correlation field from the request;
 - never serialize stack/message as control data.
 
 Recovery/startup routing is exact:
@@ -1974,13 +2004,13 @@ Unknown/malformed inbound messages return `undefined` and cause no controller/ad
 
 - [ ] **Step 1: Write RED concrete transport tests**
 
-In `tests/integration/chrome-relay-transport.test.ts`, cover:
-- `inspect()` sends exactly `AdapterInspectRequest` and accepts only `AdapterInspectResult`;
-- `armResponse()` sends exact request and rejects wrong `sessionId` or `waitId`;
-- `prepareSubmission()` accepts only matching `TransferPreparedMessage`;
-- `commitSubmission()` rejects wrong `transferId` or `waitId`;
-- `bindExpectedUserTurn()` rejects wrong `sessionId`/`waitId`;
-- `cancelSubmission()` accepts only matching `CancelTransferResult.result.transferId`;
+In `tests/integration/chrome-relay-transport.test.ts`, cover every `RelayTransport` method:
+- `RelayTransport.inspect()`: sends exactly `AdapterInspectRequest` and accepts only `AdapterInspectResult`;
+- `RelayTransport.armResponse()`: sends exactly `ArmResponseMessage` and rejects wrong `sessionId` or `waitId`;
+- `RelayTransport.prepareSubmission()`: sends exactly `PreparePeerResponseMessage` and accepts only matching `TransferPreparedMessage`;
+- `RelayTransport.commitSubmission()`: sends exactly `CommitTransferMessage` and rejects wrong `sessionId`, `transferId`, or `waitId`;
+- `RelayTransport.bindExpectedUserTurn()`: sends exactly `BindExpectedUserTurnMessage` and rejects wrong `sessionId`/`waitId`;
+- `RelayTransport.cancelSubmission()`: sends exactly `CancelTransferMessage` and accepts only matching `CancelTransferResult.sessionId` and `result.transferId`;
 - an `AdapterCommandFailure` with matching correlation becomes `RelayTransportError` preserving its `reason`;
 - `sendMessage` rejection/no receiver/channel-closed maps to `adapter-not-ready`;
 - malformed/unparseable response maps to `adapter-transport-failed`;
