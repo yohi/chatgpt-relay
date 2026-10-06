@@ -387,6 +387,7 @@ type RelayFailureReason =
   | "split-view-changed"
   | "tab-closed"
   | "invalid-navigation"
+  | "invalid-session"
   | "recovery-ambiguous"
   | "max-turns-reached"
   | "stopped-by-user";
@@ -677,6 +678,11 @@ class RelayTransportError extends Error {
 ```
 
 Adapter/domain code throws `RelayDomainError` for expected fail-closed reasons. Wire boundaries never serialize JavaScript `Error` objects; content runtime converts known/unknown thrown errors to `AdapterCommandFailure`, and the service-worker transport converts that wire failure to `RelayTransportError`.
+
+Caller-visible controller operations use this exact rule:
+- expected request/domain rejection is represented by `RelayDomainError`;
+- `RelayTransportError` must not escape `start()` or `stop()`: the controller maps it to `RelayDomainError(error.failure.reason)` after performing any required persisted fail-closed transition;
+- unexpected programming exceptions are **not** converted to `RelayDomainError` and are allowed to reject the runtime message handler so the popup can show a generic runtime failure separately from domain reasons.
 
 `maxTurns` is valid when it is an integer `>= 1`; no additional product maximum is introduced by the Plan.
 
@@ -1407,6 +1413,37 @@ class RelayController {
 
 Controller code catches `RelayTransportError` only at the orchestration boundary. It persists `error` with `stopReason = error.failure.reason` unless the current operation has a more specific Design-defined reconciliation path (Task 11 cancel/commit reconciliation). A transport failure never causes blind retry.
 
+Caller-visible `start()` semantics are exact:
+
+```text
+pre-session validation:
+  invalid Split View pair
+    -> throw RelayDomainError("pair-invalid")
+  A already generating
+    -> throw RelayDomainError("generation-in-progress")
+
+transport/domain failure before RelaySession is first persisted:
+  map RelayTransportError(reason) -> RelayDomainError(reason)
+  do not synthesize a RelaySession solely to report the failure
+
+failure after RelaySession has been persisted (for example arm failure):
+  re-enter serialized transition path
+  if the same session is still current:
+    persist state="error"
+    persist stopReason=<exact mapped reason>
+    clear expectedResponse/pendingTransfer when required by terminal consistency
+  throw RelayDomainError(<same reason>)
+
+successful start:
+  return the persisted active RelaySession
+
+unexpected non-RelayDomainError/non-RelayTransportError:
+  propagate unchanged
+  do not manufacture a domain reason
+```
+
+Therefore `start()` has a stable TypeScript signature `Promise<RelaySession>`, but expected caller-visible failure is a rejected `RelayDomainError`, never an error-valued `RelaySession`.
+
 - [ ] **Step 1: Write RED start tests**
 
 Cover:
@@ -1420,7 +1457,12 @@ Cover:
 - unbound A + first allowed prompt yields stable X → `reconcileConversationBinding(currentBinding, "X", "first-allowed-prompt") -> bound(X)`;
 - unbound A + unrelated observed X during revalidation is not adopted;
 - assistant completion received before user-turn persistence is buffered/ignored until binding is confirmed;
-- second manual A user turn fails closed.
+- second manual A user turn fails closed;
+- invalid pair → `start()` rejects `RelayDomainError("pair-invalid")` and does not create a session;
+- A generating → `start()` rejects `RelayDomainError("generation-in-progress")`;
+- transport failure before session persistence → same mapped `RelayDomainError(reason)`, no synthetic session;
+- arm/transport failure after session persistence → persisted terminal `error` with the same `stopReason`, then `start()` rejects matching `RelayDomainError(reason)`;
+- unexpected programming exception propagates unchanged and is not converted into a domain reason.
 
 - [ ] **Step 2: Run RED**
 
@@ -1594,6 +1636,40 @@ Cancellation semantics are exact:
 - `already-committed` → reconcile that transfer at most once, never start its peer response transfer, then `stopped`;
 - `unknown` → `error`.
 
+Caller-visible `stop(sessionId)` semantics are exact:
+
+```text
+no persisted active session:
+  -> throw RelayDomainError("invalid-session")
+
+persisted session id != request sessionId:
+  -> throw RelayDomainError("invalid-session")
+
+same session already in stopped/error:
+  -> return that RelaySession unchanged
+     (idempotent accepted Stop for the current session)
+
+same active session:
+  -> persist stopping (Stop linearization point)
+  -> perform the approved cancel/reconciliation path
+  -> return the resulting RelaySession
+
+valid Stop whose reconciliation ends in state="error":
+  -> still return that resulting RelaySession
+     because the Stop request itself was accepted
+
+RelayTransportError during Stop reconciliation:
+  -> follow the existing reconciliation semantics to persisted stopped/error
+  -> if the request had already been accepted, return the resulting session;
+     do not convert the accepted Stop into caller-level ok=false
+
+unexpected programming exception before/after acceptance:
+  -> propagate unchanged
+  -> do not manufacture RelayDomainError
+```
+
+Thus popup `RelayStopResult.ok` means **whether the Stop request was valid and accepted**, not whether final session state is `stopped`. A valid accepted Stop may return `ok:true` with `status.session.state === "error"`.
+
 - [ ] **Step 1: Write RED race tests**
 
 Cover:
@@ -1604,7 +1680,12 @@ Cover:
 - ambiguous commit state → error;
 - Stop vs assistant-complete;
 - Stop vs transfer acknowledgement;
-- stale continuation cannot overwrite stopped/error (Review Focus #4).
+- stale continuation cannot overwrite stopped/error (Review Focus #4);
+- no active session → `RelayDomainError("invalid-session")`;
+- wrong/stale sessionId → `RelayDomainError("invalid-session")`;
+- same current session already stopped/error → idempotently returns that session;
+- valid Stop whose reconciliation ends in error still resolves with the resulting error session;
+- unexpected programming exception is not converted to `invalid-session` or another domain reason.
 
 - [ ] **Step 2: Run RED**
 
@@ -1989,11 +2070,86 @@ Recovery/startup routing is exact:
 - every state-mutating runtime event/command handler first awaits the same `ready` promise, so startup recovery cannot race ahead of or be bypassed by later runtime routing;
 - recovery methods themselves use the controller's serialized transition/revalidation boundary from Task 12.
 
-Popup routing:
-- `relay-status` → exact `RelayStatusResult`;
-- `relay-start` → call `controller.start()`, then `controller.getStatus()`, return exact `RelayStartResult`;
-- `relay-stop` → validate sessionId, call `controller.stop(sessionId)`, reread status, return exact `RelayStopResult`;
-- preference get/set → exact Task 2 result shapes.
+Popup/controller request routing is exact.
+
+`relay-status`:
+```text
+await runtime.ready
+status = await controller.getStatus()
+return { type:"relay-status-result", status }
+```
+
+`relay-start`:
+```text
+await runtime.ready
+try:
+  await controller.start()
+  status = await controller.getStatus()
+  return { type:"relay-start-result", ok:true, status }
+catch RelayDomainError(error):
+  status = await controller.getStatus()
+  return {
+    type:"relay-start-result",
+    ok:false,
+    reason:error.reason,
+    status
+  }
+catch unexpected:
+  rethrow
+```
+
+`RelayTransportError` is never handled directly by this runtime branch because Task 9 requires `start()` to translate it to `RelayDomainError` after any required persisted terminal transition.
+
+`relay-stop`:
+```text
+await runtime.ready
+try:
+  await controller.stop(request.sessionId)
+  status = await controller.getStatus()
+  return { type:"relay-stop-result", ok:true, status }
+catch RelayDomainError(error):
+  status = await controller.getStatus()
+  return {
+    type:"relay-stop-result",
+    ok:false,
+    reason:error.reason,
+    status
+  }
+catch unexpected:
+  rethrow
+```
+
+For Stop, `ok:true` means the request was accepted. If accepted reconciliation ends in `status.session.state === "error"`, the result remains `ok:true`. Only invalid caller requests such as no-current/wrong `sessionId` produce `ok:false`.
+
+`relay-preferences-get`:
+```text
+await runtime.ready
+current = await controller.getMaxTurns()
+return { type:"relay-preferences-result", maxTurns:current }
+```
+
+`relay-preferences-set`:
+```text
+await runtime.ready
+if !Number.isInteger(request.maxTurns) || request.maxTurns < 1:
+  current = await controller.getMaxTurns()
+  do NOT call controller.setMaxTurns()
+  return {
+    type:"relay-preferences-set-result",
+    ok:false,
+    reason:"invalid-max-turns",
+    maxTurns:current
+  }
+
+saved = await controller.setMaxTurns(request.maxTurns)
+return {
+  type:"relay-preferences-set-result",
+  ok:true,
+  maxTurns:saved
+}
+```
+
+If `controller.getStatus()`, `getMaxTurns()`, or `setMaxTurns()` throws an unexpected programming/storage exception, the runtime message handler rejects. It must not convert that exception into `RelayFailureReason` or `invalid-max-turns`.
 
 Chrome event routing:
 - `tabs.onRemoved(tabId)` → `controller.handleTabRemoved(tabId)`;
@@ -2048,7 +2204,18 @@ In `tests/integration/runtime-routing.test.ts`, cover:
 - sender-supplied/forged tab data is not authority; Chrome sender metadata is used;
 - missing sender tab for adapter-originated events → rejected/no mutation;
 - `InitialUserTurnObservedMessage`, `AssistantCompleteMessage`, and `TranscriptInterferenceMessage` route with sender tabId;
-- popup status/start/stop/preferences return exact Task 2 result shapes;
+- `relay-start`: invalid pair `RelayDomainError("pair-invalid")` → `ok:false + pair-invalid`;
+- `relay-start`: generating A → `ok:false + generation-in-progress`;
+- `relay-start`: successful start → `ok:true`;
+- `relay-start`: transport failure already mapped/persisted by controller to `RelayDomainError(reason)` → `ok:false` with exact reason and status reflecting persisted terminal state;
+- `relay-start`: unexpected exception → runtime handler rejects; no typed `RelayStartResult` is fabricated;
+- `relay-stop`: valid accepted Stop ending in stopped → `ok:true`;
+- `relay-stop`: valid accepted Stop whose reconciliation ends in error → `ok:true` and status shows error;
+- `relay-stop`: no-current/wrong session `RelayDomainError("invalid-session")` → `ok:false + invalid-session`;
+- `relay-stop`: unexpected exception → runtime handler rejects; no typed `RelayStopResult` is fabricated;
+- `relay-preferences-set`: 0 and non-integer → `setMaxTurns` not called, `ok:false + invalid-max-turns`, current value returned;
+- `relay-preferences-set`: positive integer → `setMaxTurns` called once, `ok:true` with saved value;
+- unexpected preference/status exception → runtime handler rejects rather than synthesizing a domain result;
 - `tabs.onRemoved` routes only to `handleTabRemoved`;
 - `tabs.onUpdated` routes only to `handleTabUpdated`;
 - `dispose()` removes listeners.
@@ -2105,7 +2272,10 @@ Cover:
 - maxTurns defaults to 10 and persists;
 - Stop requests current session only;
 - `stopping` is visibly distinct from `stopped`;
-- machine-readable error gets an actionable user-facing explanation;
+- machine-readable `RelayFailureReason` gets an actionable user-facing explanation;
+- rejected runtime/message-channel Promise (unexpected exception path) shows a generic "Extension runtime error; refresh status/retry" UI message, does not invent a `RelayFailureReason`, and immediately issues a fresh `relay-status` request when the popup remains open;
+- Start `ok:false` and Stop `ok:false` render their exact domain reason;
+- accepted Stop with `ok:true` + `status.session.state="error"` renders the resulting session error while still treating the Stop request as accepted;
 - Review Focus #5: closing/recreating popup reconstructs status and does not mutate session.
 
 - [ ] **Step 2: Run RED**
@@ -2357,5 +2527,7 @@ Before claiming implementation complete:
 9. Confirm no implementation widened the Design-approved browser/security/protocol boundaries.
 10. Confirm every declared controller production method has a RED/GREEN semantic owner, and Task 13 tests only route Chrome events/messages into those methods.
 11. Confirm active-session terminal reasons `tab-closed`, `invalid-navigation`, `split-view-changed`, `transcript-interference`, and `max-turns-reached` are exercised by controller tests.
+12. Confirm popup-facing expected failures are emitted only from `RelayDomainError`, while unexpected exceptions reject the runtime message path and are rendered generically by the popup.
+13. Confirm invalid `maxTurns` never calls `setMaxTurns()`, and valid values are returned from the controller after persistence.
 
 If any approved Design invariant cannot be implemented against the current ChatGPT DOM, stop and return to Design Review instead of inventing a weaker protocol.
