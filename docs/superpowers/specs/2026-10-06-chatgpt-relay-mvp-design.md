@@ -342,14 +342,18 @@ Start has the following normative ordering:
 10. confirm the arm succeeded
 11. report Start success to the popup/user
 12. user manually submits the initial task to A
-13. the first allowed post-Start A user turn becomes the initial causal user turn
-14. if A was unbound, bind its first stable conversation identity only when that identity is causally associated with this allowed initial user turn
-15. only the assistant response belonging to that initial user turn and strictly after baseline may complete waitId
+13. A adapter identifies the exact first post-Start user transcript message and its stable userMessageId
+14. A adapter reports that initial user turn for the active sessionId + waitId
+15. controller re-reads/revalidates persisted state and persists causedByUserMessageId on the existing ExpectedResponse
+16. if A was unbound, controller binds its first stable conversation identity only when that identity is causally associated with this allowed initial user turn
+17. controller confirms the persisted causal binding back to A
+18. A buffers any already-completed assistant response until this binding is confirmed
+19. only the assistant response belonging to that persisted initial user turn and strictly after baseline may complete waitId
 ```
 
 An assistant response that existed before Start can therefore never satisfy the initial wait.
 
-Exactly one manual initial A user turn is permitted. A second manual user turn, regenerate/edit/branch operation, or ambiguous transcript mutation before the expected assistant response is resolved fails closed.
+Exactly one manual initial A user turn is permitted. The adapter must not emit its assistant completion until the controller has persisted that initial user turn in `ExpectedResponse.causedByUserMessageId`. A second manual user turn, regenerate/edit/branch operation, or ambiguous transcript mutation before the expected assistant response is resolved fails closed.
 
 ### 8.2 Automated target ordering
 
@@ -730,6 +734,13 @@ type RelayMessage =
       authorizationRevision: number;
     }
   | {
+      type: "initial-user-turn-observed";
+      sessionId: string;
+      waitId: string;
+      userMessageId: string;
+      conversationIdentity: string;
+    }
+  | {
       type: "assistant-complete";
       sessionId: string;
       waitId: string;
@@ -978,6 +989,7 @@ Cover at minimum:
 - a pre-Start existing assistant response is not accepted as the initial response;
 - Start is rejected when A is already generating;
 - the initial A manual prompt remains permitted and is the only manual user turn allowed by the active relay;
+- initial A assistant completion is buffered until the exact manual user transcript message is identified and persisted in `ExpectedResponse.causedByUserMessageId`;
 - valid A → B and B → A transitions;
 - relay-created target user message → causally following assistant = accepted;
 - relay-created target user message → unexpected manual user message → assistant = error, not relay completion;
@@ -1064,7 +1076,7 @@ The MVP is accepted when all of the following are demonstrated:
 2. Start persists A/B conversation bindings when stable identities exist and allows `unbound` only for a genuinely unidentified new conversation.
 3. Start succeeds only after A readiness, non-generating state, baseline capture, persisted `ExpectedResponse`, and wait arming are confirmed.
 4. An assistant response that existed before Start is never relayed as the initial A response.
-5. The user's first post-Start A user turn is permitted as the initial prompt; later unexpected manual transcript intervention fails closed.
+5. The user's first post-Start A user turn is permitted as the initial prompt, is identified as an exact transcript user message, and is persisted in `ExpectedResponse.causedByUserMessageId` before its assistant response may be accepted; later unexpected manual transcript intervention fails closed.
 6. For automated transfers, a completion is accepted only after the exact relay-created user transcript message has been identified and persisted in `causedByUserMessageId`.
 7. Correct `sessionId + waitId + causedByTransferId` without matching causal user-turn ancestry is insufficient and is rejected.
 8. A target response that completes before transfer acknowledgement/user-turn binding processing is not lost.
