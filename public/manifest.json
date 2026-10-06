@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "145",
+  "name": "ChatGPT Relay",
+  "version": "0.1.0",
+  "permissions": ["storage"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
