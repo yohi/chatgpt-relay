@@ -113,16 +113,18 @@ describe("ChatGPT DOM contract", () => {
 
     expect(inspection.generating).toBe(false)
     expect(inspection.transcript[1]?.stableDomId).toBe("44444444-4444-4444-8444-444444444444")
-    expect(inspection.transcript[1]?.branchEvidence).toBe("regenerate")
+    expect(inspection.transcript[1]?.branchEvidence).toBeNull()
   })
 
-  it("recognizes edit and regenerate controls as transcript interference evidence", async () => {
-    const page = await loadFixture("transcript-interference.html", "/c/conversation-123")
+  it("does not treat visible edit/regenerate controls as transcript mutation", async () => {
+    const page = await loadFixture("completed.html", "/c/conversation-123")
+    const transcript = readTranscript(page)
 
-    expect(readTranscript(page).map(({ branchEvidence }) => branchEvidence)).toEqual([
-      "edit",
-      "regenerate",
+    expect(transcript.map(({ stableDomId }) => stableDomId)).toEqual([
+      "33333333-3333-4333-8333-333333333333",
+      "44444444-4444-4444-8444-444444444444",
     ])
+    expect(transcript.map(({ branchEvidence }) => branchEvidence)).toEqual([null, null])
   })
 
   it("fails closed for zero or multiple main composer candidates", async () => {

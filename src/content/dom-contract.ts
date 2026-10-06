@@ -9,7 +9,11 @@ const COMPOSER_TEXTBOX = '[role="textbox"][contenteditable="true"][data-composer
 const TRANSCRIPT_UNIT = "[data-chatgpt-search-unit-key]"
 const MESSAGE_IDS = "data-chatgpt-search-message-ids"
 const SELECTION_MESSAGE_ID = "data-chatgpt-selection-message-id"
+const EDIT_CONTROL = 'button[aria-label="メッセージを編集"]'
+const REGENERATE_CONTROL = 'button[aria-label="回答を再生成"]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export type TranscriptMutationControl = "edit" | "regenerate"
 
 export type TranscriptEntry = {
   readonly role: "user" | "assistant"
@@ -128,17 +132,6 @@ function readRole(unit: Element): TranscriptEntry["role"] {
   failClosed("dom-contract-ambiguous")
 }
 
-function readBranchEvidence(unit: Element): string | null {
-  const evidence: string[] = []
-  if (unit.querySelectorAll('button[aria-label="メッセージを編集"]').length > 0) {
-    evidence.push("edit")
-  }
-  if (unit.querySelectorAll('button[aria-label="回答を再生成"]').length > 0) {
-    evidence.push("regenerate")
-  }
-  return evidence.length === 0 ? null : evidence.join(",")
-}
-
 function readTranscriptIn(root: HTMLElement): TranscriptEntry[] {
   const units = Array.from(root.querySelectorAll(TRANSCRIPT_UNIT)).filter(
     (unit) => !isExcludedFromMainThread(unit),
@@ -156,7 +149,7 @@ function readTranscriptIn(root: HTMLElement): TranscriptEntry[] {
       stableDomId,
       roleOrdinal: roleOrdinals[role],
       text: normalizeRelayText(unit.textContent ?? ""),
-      branchEvidence: readBranchEvidence(unit),
+      branchEvidence: null,
     }
   })
 }
@@ -173,6 +166,24 @@ export function findSubmitControl(document: Document): HTMLElement {
   )
   if (!(submitControl instanceof HTMLElement)) failClosed("dom-contract-ambiguous")
   return submitControl
+}
+
+export function classifyTranscriptMutationControl(
+  document: Document,
+  eventTarget: EventTarget | null,
+): TranscriptMutationControl | null {
+  const view = document.defaultView
+  if (view === null || !(eventTarget instanceof view.Element)) return null
+  const { root } = resolveMainThread(document)
+  if (!root.contains(eventTarget) || isExcludedFromMainThread(eventTarget)) return null
+
+  const control = eventTarget.closest(`${EDIT_CONTROL},${REGENERATE_CONTROL}`)
+  if (control === null || isExcludedFromMainThread(control)) return null
+  const transcriptUnit = control.closest(TRANSCRIPT_UNIT)
+  if (transcriptUnit === null || isExcludedFromMainThread(transcriptUnit)) return null
+  if (control.matches(EDIT_CONTROL)) return "edit"
+  if (control.matches(REGENERATE_CONTROL)) return "regenerate"
+  return null
 }
 
 export function inspectChatGptDom(document: Document): DomInspection {
