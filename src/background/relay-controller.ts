@@ -1,4 +1,11 @@
-import type { RelayFailureReason, RelaySession, RelayStatusSnapshot } from "../shared/domain"
+import type {
+  ExpectedResponse,
+  PendingTransfer,
+  RelayFailureReason,
+  RelaySession,
+  RelayStatusSnapshot,
+  Side,
+} from "../shared/domain"
 import { RelayDomainError, RelayTransportError } from "../shared/errors"
 import type {
   AdapterInspectRequest,
@@ -82,6 +89,33 @@ function samePair(left: SplitPair, right: SplitPair): boolean {
     left.tabA === right.tabA &&
     left.tabB === right.tabB
   )
+}
+
+function targetSide(sourceSide: Side): Side {
+  return sourceSide === "a" ? "b" : "a"
+}
+
+function targetTab(session: RelaySession, side: Side): number {
+  return side === "a" ? session.tabA : session.tabB
+}
+
+function targetBinding(session: RelaySession, side: Side): RelaySession["conversationA"] {
+  return side === "a" ? session.conversationA : session.conversationB
+}
+
+function withBinding(
+  session: RelaySession,
+  side: Side,
+  binding: RelaySession["conversationA"],
+): RelaySession {
+  return side === "a"
+    ? { ...session, conversationA: binding }
+    : { ...session, conversationB: binding }
+}
+
+function stoppedForMaxTurns(session: RelaySession): RelaySession {
+  const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = session
+  return { ...retained, state: "stopped", stopReason: "max-turns-reached" }
 }
 
 export class RelayController {
@@ -319,9 +353,9 @@ export class RelayController {
     if (
       current === null ||
       current.id !== event.sessionId ||
-      current.state !== "waiting-a" ||
-      current.tabA !== tabId ||
-      expected?.side !== "a" ||
+      (current.state !== "waiting-a" && current.state !== "waiting-b") ||
+      targetTab(current, expected?.side ?? "a") !== tabId ||
+      expected === undefined ||
       expected.waitId !== event.waitId ||
       expected.causedByUserMessageId === undefined
     ) {
@@ -329,25 +363,365 @@ export class RelayController {
     }
     if (
       event.causedByUserMessageId !== expected.causedByUserMessageId ||
+      event.causedByTransferId !== expected.causedByTransferId ||
       (expected.baselineMessageId !== null && event.message.messageId === expected.baselineMessageId)
     ) {
+      await this.failSession(current.id, "relay-causality-ambiguous")
+      return
+    }
+    const lastMessage = expected.side === "a" ? current.lastMessageA : current.lastMessageB
+    if (lastMessage === event.message.messageId) return
+
+    if (current.turn + 1 > current.maxTurns) {
       await this.withTransition(
         { sessionId: current.id, revision: current.revision, waitId: expected.waitId },
-        (latest) => ({
-          nextSession: terminalFailure(latest, "relay-causality-ambiguous"),
-          result: undefined,
-        }),
+        (latest) => ({ nextSession: stoppedForMaxTurns(latest), result: undefined }),
       )
       return
     }
 
-    if (current.lastMessageA === event.message.messageId) return
+    let inspected: AdapterInspectResult
+    try {
+      inspected = await this.deps.transport.inspect(tabId, { type: "adapter-inspect" })
+    } catch (error) {
+      if (!(error instanceof RelayTransportError)) throw error
+      await this.failSession(current.id, error.failure.reason)
+      throw new RelayDomainError(error.failure.reason)
+    }
+
+    if (!inspected.snapshot.ready) {
+      await this.failSession(current.id, "adapter-not-ready")
+      return
+    }
+    if (inspected.snapshot.generating) {
+      await this.failSession(current.id, "generation-in-progress")
+      return
+    }
+
+    let sourceBinding: RelaySession["conversationA"]
+    try {
+      if (targetBinding(current, expected.side).state === "unbound") {
+        throw new RelayDomainError("conversation-changed")
+      }
+      sourceBinding = reconcileConversationBinding(
+        targetBinding(current, expected.side),
+        inspected.snapshot.conversationIdentity,
+        "revalidation",
+      )
+    } catch (error) {
+      if (!(error instanceof RelayDomainError)) throw error
+      await this.failSession(current.id, error.reason)
+      return
+    }
+
+    const transferId = crypto.randomUUID()
+    const peerWaitId = crypto.randomUUID()
+    const destinationSide = targetSide(expected.side)
+    const destinationTabId = targetTab(current, destinationSide)
+    const pendingTransfer: PendingTransfer = {
+      id: transferId,
+      sourceTabId: tabId,
+      targetTabId: destinationTabId,
+      sourceMessageId: event.message.messageId,
+      payloadHash: event.message.textHash,
+      targetWaitId: peerWaitId,
+      submissionState: "preparing",
+    }
+    const nextState = destinationSide === "b" ? "dispatching-b" : "dispatching-a"
+    const sourceLastMessage = expected.side === "a"
+      ? { lastMessageA: event.message.messageId }
+      : { lastMessageB: event.message.messageId }
+    try {
+      await this.withTransition(
+        {
+          sessionId: current.id,
+          revision: current.revision,
+          waitId: expected.waitId,
+        },
+        (latest) => {
+          const { expectedResponse: _expectedResponse, ...withoutExpected } = latest
+          return {
+            nextSession: {
+              ...withBinding(withoutExpected, expected.side, sourceBinding),
+              ...sourceLastMessage,
+              state: nextState,
+              pendingTransfer,
+            },
+            result: undefined,
+            effect: async () => {
+              const prepared = await this.deps.transport.prepareSubmission(destinationTabId, {
+                type: "prepare-peer-response",
+                sessionId: latest.id,
+                transferId,
+                waitId: peerWaitId,
+                text: event.message.text,
+                authorizationRevision: latest.revision + 1,
+              })
+              if (
+                prepared.sessionId !== latest.id ||
+                prepared.transferId !== transferId ||
+                prepared.waitId !== peerWaitId
+              ) {
+                throw new RelayTransportError({
+                  command: "prepare-peer-response",
+                  tabId: destinationTabId,
+                  sessionId: latest.id,
+                  transferId,
+                  waitId: peerWaitId,
+                  reason: "adapter-transport-failed",
+                })
+              }
+              await this.handleTransferPrepared(destinationTabId, prepared)
+            },
+          }
+        },
+      )
+    } catch (error) {
+      if (error instanceof RelayTransportError) {
+        await this.failTransfer(current.id, transferId, error.failure.reason)
+        throw new RelayDomainError(error.failure.reason)
+      }
+      if (error instanceof RelayDomainError && error.reason === "invalid-session") return
+      throw error
+    }
+  }
+
+  async handleTransferPrepared(tabId: number, event: TransferPreparedMessage): Promise<void> {
+    const current = await this.deps.sessions.read()
+    const pending = current?.pendingTransfer
+    if (
+      current === null ||
+      current.id !== event.sessionId ||
+      pending === undefined ||
+      pending.id !== event.transferId ||
+      pending.targetTabId !== tabId ||
+      pending.targetWaitId !== event.waitId ||
+      pending.submissionState !== "preparing" ||
+      (current.state !== "dispatching-a" && current.state !== "dispatching-b")
+    ) {
+      return
+    }
+
+    const side = pending.targetTabId === current.tabA ? "a" : "b"
+    let reconciledBinding: RelaySession["conversationA"]
+    try {
+      reconciledBinding = reconcileConversationBinding(
+        targetBinding(current, side),
+        event.conversationIdentity,
+        "revalidation",
+      )
+    } catch (error) {
+      if (!(error instanceof RelayDomainError)) throw error
+      await this.failTransfer(current.id, pending.id, error.reason)
+      return
+    }
+
+    const authorizationRevision = current.revision + 1
+    const expectedResponse: ExpectedResponse = {
+      sessionId: current.id,
+      waitId: pending.targetWaitId,
+      side,
+      tabId: pending.targetTabId,
+      baselineMessageId: event.baselineMessageId,
+      causedByTransferId: pending.id,
+    }
+    try {
+      await this.withTransition(
+        {
+          sessionId: current.id,
+          revision: current.revision,
+          transferId: pending.id,
+        },
+        (latest) => {
+          const latestPending = latest.pendingTransfer
+          if (
+            latestPending === undefined ||
+            latestPending.id !== pending.id ||
+            latestPending.targetWaitId !== event.waitId
+          ) {
+            throw new RelayDomainError("invalid-session")
+          }
+          return {
+            nextSession: {
+              ...withBinding(latest, side, reconciledBinding),
+              expectedResponse,
+              pendingTransfer: {
+                ...latestPending,
+                targetBaselineMessageId: event.baselineMessageId,
+                authorizationRevision,
+                submissionState: "authorized",
+              },
+            },
+            result: undefined,
+            effect: async () => {
+              await this.deps.transport.armResponse(pending.targetTabId, {
+                type: "arm-response",
+                expected: expectedResponse,
+                authorizationRevision,
+              })
+              assertCurrentSession(await this.deps.sessions.read(), {
+                sessionId: current.id,
+                revision: authorizationRevision,
+                waitId: pending.targetWaitId,
+                transferId: pending.id,
+              })
+              const committed = await this.deps.transport.commitSubmission(pending.targetTabId, {
+                type: "commit-transfer",
+                sessionId: current.id,
+                transferId: pending.id,
+                waitId: pending.targetWaitId,
+                authorizationRevision,
+                authorizedConversationIdentity: event.conversationIdentity,
+              })
+              if (
+                committed.sessionId !== current.id ||
+                committed.transferId !== pending.id ||
+                committed.waitId !== pending.targetWaitId
+              ) {
+                throw new RelayTransportError({
+                  command: "commit-transfer",
+                  tabId: pending.targetTabId,
+                  sessionId: current.id,
+                  transferId: pending.id,
+                  waitId: pending.targetWaitId,
+                  reason: "adapter-transport-failed",
+                })
+              }
+              await this.handleTransferCommitted(pending.targetTabId, committed)
+            },
+          }
+        },
+      )
+    } catch (error) {
+      if (error instanceof RelayTransportError) {
+        await this.failTransfer(current.id, pending.id, error.failure.reason)
+        throw new RelayDomainError(error.failure.reason)
+      }
+      if (error instanceof RelayDomainError && error.reason === "invalid-session") return
+      throw error
+    }
+  }
+
+  async handleTransferCommitted(tabId: number, event: TransferCommittedMessage): Promise<void> {
+    const current = await this.deps.sessions.read()
+    const pending = current?.pendingTransfer
+    const expected = current?.expectedResponse
+    if (
+      current === null ||
+      current.id !== event.sessionId ||
+      pending === undefined ||
+      expected === undefined ||
+      pending.id !== event.transferId ||
+      pending.targetTabId !== tabId ||
+      pending.targetWaitId !== event.waitId ||
+      pending.submissionState !== "authorized" ||
+      expected.waitId !== event.waitId ||
+      expected.causedByTransferId !== event.transferId
+    ) {
+      return
+    }
+    if (
+      event.userMessageId.length === 0 ||
+      event.conversationIdentity.length === 0 ||
+      event.userMessageId === pending.targetBaselineMessageId
+    ) {
+      await this.failTransfer(current.id, pending.id, "relay-causality-ambiguous")
+      return
+    }
+
+    const side = expected.side
+    let boundConversation: RelaySession["conversationA"]
+    try {
+      boundConversation = reconcileConversationBinding(
+        targetBinding(current, side),
+        event.conversationIdentity,
+        "first-allowed-prompt",
+      )
+    } catch (error) {
+      if (!(error instanceof RelayDomainError)) throw error
+      await this.failTransfer(current.id, pending.id, error.reason)
+      return
+    }
+
+    const nextState = side === "a" ? "waiting-a" : "waiting-b"
+    const authorizationRevision = current.revision + 1
+    try {
+      await this.withTransition(
+        {
+          sessionId: current.id,
+          revision: current.revision,
+          transferId: pending.id,
+          waitId: expected.waitId,
+        },
+        (latest) => {
+          const latestPending = latest.pendingTransfer
+          const latestExpected = latest.expectedResponse
+          if (
+            latestPending === undefined ||
+            latestExpected === undefined ||
+            latestPending.id !== pending.id ||
+            latestExpected.waitId !== expected.waitId
+          ) {
+            throw new RelayDomainError("invalid-session")
+          }
+          return {
+            nextSession: {
+              ...withBinding(latest, side, boundConversation),
+              state: nextState,
+              turn: latest.turn + 1,
+              expectedResponse: {
+                ...latestExpected,
+                causedByUserMessageId: event.userMessageId,
+              },
+              pendingTransfer: {
+                ...latestPending,
+                targetUserMessageId: event.userMessageId,
+                submissionState: "committed",
+              },
+            },
+            result: undefined,
+            effect: async () => {
+              await this.deps.transport.bindExpectedUserTurn(tabId, {
+                type: "bind-expected-user-turn",
+                sessionId: current.id,
+                waitId: expected.waitId,
+                userMessageId: event.userMessageId,
+                conversationIdentity: event.conversationIdentity,
+                authorizationRevision,
+              })
+            },
+          }
+        },
+      )
+    } catch (error) {
+      if (error instanceof RelayTransportError) {
+        await this.failTransfer(current.id, pending.id, error.failure.reason)
+        throw new RelayDomainError(error.failure.reason)
+      }
+      if (error instanceof RelayDomainError && error.reason === "invalid-session") return
+      throw error
+    }
+  }
+
+  private async failSession(sessionId: string, reason: RelayFailureReason): Promise<void> {
+    const current = await this.deps.sessions.read()
+    if (current === null || current.id !== sessionId) return
     await this.withTransition(
-      { sessionId: current.id, revision: current.revision, waitId: expected.waitId },
-      (latest) => ({
-        nextSession: { ...latest, lastMessageA: event.message.messageId },
-        result: undefined,
-      }),
+      { sessionId, revision: current.revision },
+      (latest) => ({ nextSession: terminalFailure(latest, reason), result: undefined }),
+    )
+  }
+
+  private async failTransfer(
+    sessionId: string,
+    transferId: string,
+    reason: RelayFailureReason,
+  ): Promise<void> {
+    const current = await this.deps.sessions.read()
+    if (current === null || current.id !== sessionId || current.pendingTransfer?.id !== transferId) return
+    await this.withTransition(
+      { sessionId, revision: current.revision, transferId },
+      (latest) => ({ nextSession: terminalFailure(latest, reason), result: undefined }),
     )
   }
 
