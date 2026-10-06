@@ -1,4 +1,5 @@
 import type {
+  CancelSubmissionResult,
   ExpectedResponse,
   PendingTransfer,
   RelayFailureReason,
@@ -54,6 +55,12 @@ export type TransitionDecision<T> = {
   readonly nextSession: RelaySession
   readonly result: T
   readonly effect?: () => Promise<void>
+}
+
+export type CancellationReconciliationEvent = {
+  readonly sessionId: string
+  readonly transferId: string
+  readonly result: CancelSubmissionResult
 }
 
 type RelayControllerDeps = {
@@ -118,6 +125,11 @@ function stoppedForMaxTurns(session: RelaySession): RelaySession {
   return { ...retained, state: "stopped", stopReason: "max-turns-reached" }
 }
 
+function stoppedByUser(session: RelaySession): RelaySession {
+  const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = session
+  return { ...retained, state: "stopped", stopReason: "stopped-by-user" }
+}
+
 export class RelayController {
   constructor(private readonly deps: RelayControllerDeps) {}
 
@@ -164,6 +176,168 @@ export class RelayController {
     }
     await this.deps.preferences.writeMaxTurns(maxTurns)
     return this.deps.preferences.readMaxTurns()
+  }
+
+  async stop(sessionId: string): Promise<RelaySession> {
+    const current = await this.deps.sessions.read()
+    if (current === null || current.id !== sessionId) throw new RelayDomainError("invalid-session")
+    if (current.state === "stopped" || current.state === "error" || current.state === "stopping") {
+      return current
+    }
+
+    const stopping = await this.withTransition(
+      { sessionId, revision: current.revision },
+      (latest) => {
+        const nextSession = { ...latest, state: "stopping" as const }
+        return {
+          nextSession,
+          result: { ...nextSession, revision: latest.revision + 1 },
+        }
+      },
+    )
+    const pending = stopping.pendingTransfer
+    if (pending === undefined) {
+      await this.withTransition(
+        { sessionId, revision: stopping.revision },
+        (latest) => ({ nextSession: stoppedByUser(latest), result: undefined }),
+      )
+      const stopped = await this.deps.sessions.read()
+      if (stopped === null || stopped.id !== sessionId) throw new RelayDomainError("invalid-session")
+      return stopped
+    }
+
+    try {
+      const response = await this.deps.transport.cancelSubmission(pending.targetTabId, {
+        type: "cancel-transfer",
+        sessionId,
+        transferId: pending.id,
+      })
+      if (response.type !== "cancel-transfer-result" || response.sessionId !== sessionId) {
+        await this.failTransfer(sessionId, pending.id, "adapter-transport-failed")
+      } else if (response.result.transferId !== pending.id) {
+        await this.failTransfer(sessionId, pending.id, "adapter-transport-failed")
+      } else {
+        await this.handleCancellationResult({
+          sessionId,
+          transferId: pending.id,
+          result: response.result,
+        })
+      }
+    } catch (error) {
+      if (error instanceof RelayTransportError) {
+        await this.failTransfer(sessionId, pending.id, error.failure.reason)
+      } else {
+        throw error
+      }
+    }
+
+    const reconciled = await this.deps.sessions.read()
+    if (reconciled === null || reconciled.id !== sessionId) throw new RelayDomainError("invalid-session")
+    return reconciled
+  }
+
+  async handleCancellationResult(event: CancellationReconciliationEvent): Promise<void> {
+    const current = await this.deps.sessions.read()
+    const pending = current?.pendingTransfer
+    if (
+      current === null ||
+      current.id !== event.sessionId ||
+      current.state !== "stopping" ||
+      pending === undefined ||
+      pending.id !== event.transferId ||
+      event.result.transferId !== event.transferId
+    ) {
+      return
+    }
+
+    switch (event.result.status) {
+      case "cancelled-before-commit":
+        if (pending.submissionState === "committed") {
+          await this.failTransfer(current.id, pending.id, "recovery-ambiguous")
+          return
+        }
+        await this.withTransition(
+          { sessionId: current.id, revision: current.revision, transferId: pending.id },
+          (latest) => ({ nextSession: stoppedByUser(latest), result: undefined }),
+        )
+        return
+      case "already-committed":
+        await this.reconcileCommittedStop(current, pending, event.result)
+        return
+      case "unknown":
+        await this.failTransfer(current.id, pending.id, "recovery-ambiguous")
+        return
+    }
+  }
+
+  private async reconcileCommittedStop(
+    current: RelaySession,
+    pending: PendingTransfer,
+    result: Extract<CancelSubmissionResult, { readonly status: "already-committed" }>,
+  ): Promise<void> {
+    if (
+      pending.submissionState === "preparing" ||
+      result.userMessageId === null ||
+      result.conversationIdentity === null ||
+      (pending.targetUserMessageId !== undefined &&
+        pending.targetUserMessageId !== result.userMessageId) ||
+      (pending.submissionState === "committed" &&
+        pending.targetUserMessageId !== result.userMessageId)
+    ) {
+      await this.failTransfer(current.id, pending.id, "relay-causality-ambiguous")
+      return
+    }
+    const userMessageId = result.userMessageId
+    const conversationIdentity = result.conversationIdentity
+
+    const side = pending.targetTabId === current.tabA ? "a" : "b"
+    const binding = targetBinding(current, side)
+    let reconciledBinding: RelaySession["conversationA"]
+    try {
+      reconciledBinding = reconcileConversationBinding(
+        binding,
+        conversationIdentity,
+        binding.state === "unbound" ? "first-allowed-prompt" : "revalidation",
+      )
+    } catch (error) {
+      if (!(error instanceof RelayDomainError)) throw error
+      await this.failTransfer(current.id, pending.id, error.reason)
+      return
+    }
+
+    const currentExpected = current.expectedResponse
+    if (
+      currentExpected !== undefined &&
+      (currentExpected.waitId !== pending.targetWaitId ||
+        currentExpected.causedByTransferId !== pending.id ||
+        (currentExpected.causedByUserMessageId !== undefined &&
+          currentExpected.causedByUserMessageId !== userMessageId))
+    ) {
+      await this.failTransfer(current.id, pending.id, "relay-causality-ambiguous")
+      return
+    }
+
+    const alreadyCounted = pending.submissionState === "committed"
+    await this.withTransition(
+      { sessionId: current.id, revision: current.revision, transferId: pending.id },
+      (latest) => {
+        const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = latest
+        return {
+          nextSession: {
+            ...withBinding(retained, side, reconciledBinding),
+            state: "stopped",
+            turn: alreadyCounted ? latest.turn : latest.turn + 1,
+            stopReason: "stopped-by-user",
+            pendingTransfer: {
+              ...pending,
+              targetUserMessageId: userMessageId,
+              submissionState: "committed",
+            },
+          },
+          result: undefined,
+        }
+      },
+    )
   }
 
   async start(): Promise<RelaySession> {
@@ -490,6 +664,35 @@ export class RelayController {
     const current = await this.deps.sessions.read()
     const pending = current?.pendingTransfer
     if (
+      current !== null &&
+      current.id === event.sessionId &&
+      (current.state === "stopping" || current.state === "stopped" || current.state === "error")
+    ) {
+      if (pending !== undefined && pending.id !== event.transferId) return
+      try {
+        const cancellation = await this.deps.transport.cancelSubmission(tabId, {
+          type: "cancel-transfer",
+          sessionId: event.sessionId,
+          transferId: event.transferId,
+        })
+        if (
+          current.state === "stopping" &&
+          cancellation.type === "cancel-transfer-result" &&
+          cancellation.sessionId === event.sessionId &&
+          cancellation.result.transferId === event.transferId
+        ) {
+          await this.handleCancellationResult({
+            sessionId: event.sessionId,
+            transferId: event.transferId,
+            result: cancellation.result,
+          })
+        }
+      } catch (error) {
+        if (!(error instanceof RelayTransportError)) throw error
+      }
+      return
+    }
+    if (
       current === null ||
       current.id !== event.sessionId ||
       pending === undefined ||
@@ -573,6 +776,12 @@ export class RelayController {
                 authorizationRevision,
                 authorizedConversationIdentity: event.conversationIdentity,
               })
+              assertCurrentSession(await this.deps.sessions.read(), {
+                sessionId: current.id,
+                revision: authorizationRevision,
+                waitId: pending.targetWaitId,
+                transferId: pending.id,
+              })
               if (
                 committed.sessionId !== current.id ||
                 committed.transferId !== pending.id ||
@@ -607,8 +816,31 @@ export class RelayController {
     const pending = current?.pendingTransfer
     const expected = current?.expectedResponse
     if (
+      current !== null &&
+      current.state === "stopping" &&
+      pending !== undefined &&
+      expected !== undefined &&
+      current.id === event.sessionId &&
+      pending.id === event.transferId &&
+      pending.targetWaitId === event.waitId &&
+      expected.waitId === event.waitId
+    ) {
+      await this.handleCancellationResult({
+        sessionId: event.sessionId,
+        transferId: event.transferId,
+        result: {
+          status: "already-committed",
+          transferId: event.transferId,
+          userMessageId: event.userMessageId,
+          conversationIdentity: event.conversationIdentity,
+        },
+      })
+      return
+    }
+    if (
       current === null ||
       current.id !== event.sessionId ||
+      (current.state !== "dispatching-a" && current.state !== "dispatching-b") ||
       pending === undefined ||
       expected === undefined ||
       pending.id !== event.transferId ||
