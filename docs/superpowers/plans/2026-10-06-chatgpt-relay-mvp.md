@@ -1770,7 +1770,7 @@ git commit -m "feat: add relay control popup"
   - npm script `test:browser`.
   - `MV3_IDLE_WAIT_MS = 35_000`.
   - Playwright test timeout for the idle/restart case: `90_000` ms.
-  - one persistent-context extension fixture exposing `context`, `extensionId`, and the original Playwright `Worker` handle.
+  - one persistent-context extension fixture exposing `context`, `extensionId`, and the original service worker; the MV3 idle/restart test must reuse the same Playwright `Worker` handle.
 
 - [ ] **Step 1: Write RED browser tests**
 
