@@ -492,10 +492,13 @@ describe("RelayController automated transfer", () => {
         revision: dispatching.revision,
         transferId: dispatching.pendingTransfer.id,
       },
-      (current) => ({
-        nextSession: { ...current, state: "stopped", stopReason: "stopped-by-user" },
-        result: undefined,
-      }),
+      (current) => {
+        const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = current
+        return {
+          nextSession: { ...retained, state: "stopped", turn: 10, stopReason: "max-turns-reached" },
+          result: undefined,
+        }
+      },
     )
     harness.resolvePrepared({
       type: "transfer-prepared",
@@ -508,8 +511,55 @@ describe("RelayController automated transfer", () => {
 
     await inFlight
 
-    expect(harness.current()).toMatchObject({ state: "stopped", stopReason: "stopped-by-user" })
+    expect(harness.current()).toMatchObject({ state: "stopped", stopReason: "max-turns-reached", turn: 10 })
     expect(harness.calls).toEqual(["prepare"])
+  })
+
+  it("does not let a deferred committed acknowledgement restore max-turn terminal state", async () => {
+    const harness = createTransferHarness({ deferCommit: true })
+    const active = await startAndBindA(harness)
+    const inFlight = harness.controller.handleAssistantComplete(11, sourceCompletion(active))
+    await harness.commitStarted
+    const dispatching = harness.current()
+    if (
+      dispatching === null ||
+      dispatching.pendingTransfer === undefined ||
+      dispatching.expectedResponse === undefined
+    ) {
+      throw new Error("missing authorized transfer")
+    }
+    await harness.controller.withTransition(
+      {
+        sessionId: dispatching.id,
+        revision: dispatching.revision,
+        transferId: dispatching.pendingTransfer.id,
+        waitId: dispatching.expectedResponse.waitId,
+      },
+      (current) => {
+        const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = current
+        return {
+          nextSession: { ...retained, state: "stopped", turn: 10, stopReason: "max-turns-reached" },
+          result: undefined,
+        }
+      },
+    )
+    harness.resolveCommitted({
+      type: "transfer-committed",
+      sessionId: dispatching.id,
+      transferId: dispatching.pendingTransfer.id,
+      waitId: dispatching.pendingTransfer.targetWaitId,
+      userMessageId: "user-created-b",
+      conversationIdentity: "conversation-b",
+    })
+
+    await inFlight
+    await harness.controller.handleAssistantComplete(11, sourceCompletion(active))
+
+    expect(harness.current()).toMatchObject({
+      state: "stopped",
+      turn: 10,
+      stopReason: "max-turns-reached",
+    })
   })
 
   it("ignores stale transfer identifiers without advancing the session", async () => {
