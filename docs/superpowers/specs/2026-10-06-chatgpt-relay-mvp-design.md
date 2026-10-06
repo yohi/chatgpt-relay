@@ -1,7 +1,7 @@
 # ChatGPT Relay MVP Design
 
 Date: 2026-10-06
-Status: Proposed baseline
+Status: Design baseline — awaiting user review
 Scope: Chrome extension MVP
 
 ## 1. Purpose
@@ -49,9 +49,9 @@ The MVP flow is:
 
 1. The user opens two ChatGPT tabs.
 2. The user places them in one Chrome Split View.
-3. The user establishes any role-specific instructions independently in A and B.
-4. The user starts ChatGPT Relay.
-5. The extension identifies the two tabs in the Split View and records them as A and B.
+3. The user establishes any role-specific instructions independently in the two sessions.
+4. The user focuses the ChatGPT tab that should initiate the relay and starts ChatGPT Relay.
+5. The focused eligible tab becomes A; the other eligible tab in the same Split View becomes B.
 6. The user sends the initial task to A manually.
 7. After A finishes generating, the extension captures the completed assistant response.
 8. The extension sends that response to B inside a relay envelope.
@@ -60,6 +60,8 @@ The MVP flow is:
 11. Steps 7-10 repeat until Stop, `maxTurns`, or an error condition ends the relay.
 
 The extension does not own the initial task prompt in the MVP.
+
+The Start action is valid only when the currently active tab is an eligible `chatgpt.com` tab in a valid two-tab Split View pair. This makes A/B assignment deterministic without depending on an unavailable or fragile notion of visual left/right position.
 
 ## 5. Architecture
 
@@ -159,6 +161,8 @@ The MVP requires Chrome 140+ behavior sufficient to inspect `Tab.splitViewId`.
 
 A valid pair is exactly two eligible `chatgpt.com` tabs in the same browser window that share the same non-default Split View identifier.
 
+A is the currently active eligible ChatGPT tab at Start time. B is the other eligible ChatGPT tab sharing the same Split View identifier.
+
 The controller must reject:
 
 - Zero or one eligible tab.
@@ -189,6 +193,14 @@ in this conversation.
 This keeps the extension role-neutral. The user defines roles such as implementation, review, debate, or refinement inside each ChatGPT conversation.
 
 The envelope itself is static in the MVP.
+
+### 7.1 Canonical relay payload
+
+The MVP relays text only.
+
+The adapter extracts user-visible assistant text into a normalized plain-text payload that preserves meaningful line breaks and code-block text but never relays executable HTML or page markup.
+
+Images, generated files, interactive widgets, and other non-text assistant artifacts are outside the MVP. If an assistant response contains no relayable text, the session stops with an actionable error rather than sending an empty or guessed representation.
 
 ## 8. Completion detection
 
@@ -231,9 +243,19 @@ The conceptual relay session is:
 type RelayState =
   | "idle"
   | "waiting-a"
+  | "dispatching-b"
   | "waiting-b"
+  | "dispatching-a"
   | "stopped"
   | "error";
+
+type PendingTransfer = {
+  id: string;
+  sourceTabId: number;
+  targetTabId: number;
+  sourceMessageId: string;
+  payloadHash: string;
+};
 
 type RelaySession = {
   id: string;
@@ -245,6 +267,7 @@ type RelaySession = {
   maxTurns: number;
   lastMessageA?: string;
   lastMessageB?: string;
+  pendingTransfer?: PendingTransfer;
   stopReason?: string;
 };
 ```
@@ -253,15 +276,19 @@ Semantics:
 
 - `idle`: no active relay.
 - `waiting-a`: only a newly completed response from A is accepted.
+- `dispatching-b`: an A response has been accepted and exactly one transfer to B is being reconciled.
 - `waiting-b`: only a newly completed response from B is accepted.
+- `dispatching-a`: a B response has been accepted and exactly one transfer to A is being reconciled.
 - `stopped`: relay ended normally or by explicit user action.
 - `error`: relay stopped because continuing safely is not possible.
 
 The initial active state after Start is `waiting-a`.
 
-A completed A response advances the session to `waiting-b` only after the command to B has been accepted for execution.
+When a completed source response is accepted, the controller first persists a `PendingTransfer` and moves to the appropriate `dispatching-*` state. Only then may it command the target adapter to submit.
 
-A completed B response advances the session to `waiting-a` only after the command to A has been accepted for execution.
+The target adapter returns a transfer acknowledgement only after it has performed and confirmed the UI submission. After that acknowledgement is persisted, the controller increments `turn`, clears `pendingTransfer`, and moves to the peer `waiting-*` state.
+
+A missing acknowledgement is never grounds for blind retransmission. If the service worker, tab, or content script is interrupted during the dispatch window, recovery must inspect target-page evidence and either reconcile the transfer as already submitted or stop with `error` when the result is ambiguous.
 
 Unexpected-side events are ignored or rejected and must not advance the state machine.
 
@@ -279,7 +306,9 @@ A → B : turn 3
 
 The default `maxTurns` is 10.
 
-The controller must stop before dispatching a transfer that would exceed `maxTurns`.
+The controller must stop before creating a `PendingTransfer` that would exceed `maxTurns`.
+
+The turn counter increments only after the target submission is confirmed.
 
 This definition avoids ambiguity between "round", "exchange", and "message".
 
@@ -306,7 +335,8 @@ Message types should be explicit and versionable, for example:
 type RelayMessage =
   | { type: "adapter-ready"; tabId: number }
   | { type: "assistant-complete"; tabId: number; message: AssistantResponse }
-  | { type: "submit-peer-response"; sessionId: string; text: string }
+  | { type: "submit-peer-response"; sessionId: string; transferId: string; text: string }
+  | { type: "transfer-submitted"; sessionId: string; transferId: string }
   | { type: "relay-start" }
   | { type: "relay-stop"; reason: string };
 ```
@@ -347,6 +377,8 @@ The controller records a machine-readable stop reason and exposes a user-readabl
 
 No automatic retry may create a duplicate user-visible ChatGPT message.
 
+Submission commands are identified by `transferId`. A target adapter must reject a duplicate command it can prove it has already applied. If it cannot prove whether a prior interrupted command was applied, it must not guess; the controller reconciles visible page state or stops the session.
+
 ## 16. Reload and resynchronization
 
 A ChatGPT tab reload must not automatically resume by replaying the last peer message.
@@ -355,9 +387,10 @@ After reload:
 
 1. The content script announces readiness.
 2. The controller checks whether the tab belongs to the persisted active session.
-3. The adapter reports the latest visible assistant-message identity and current generation state.
+3. The adapter reports the latest visible assistant-message identity, current generation state, and any evidence relevant to a persisted `PendingTransfer`.
 4. The controller compares that evidence with persisted state.
-5. Relay resumes only if state can be reconciled without ambiguity.
+5. A dispatch interrupted after visible submission but before acknowledgement is reconciled as submitted only when target-page evidence is unambiguous.
+6. Relay resumes only if state can be reconciled without ambiguity.
 
 If reconciliation is ambiguous, the session transitions to `error` and requires the user to restart.
 
@@ -472,6 +505,8 @@ The MVP is accepted when all of the following are demonstrated:
 10. Service-worker suspension does not lose active relay state.
 11. A DOM recognition failure stops the relay instead of guessing.
 12. The relay controller contains no ChatGPT-specific DOM selectors.
+13. An interrupted dispatch is never blindly resubmitted when prior submission status is ambiguous.
+14. The active tab at Start is deterministically assigned as A and the paired tab as B.
 
 ## 21. Future phases
 
