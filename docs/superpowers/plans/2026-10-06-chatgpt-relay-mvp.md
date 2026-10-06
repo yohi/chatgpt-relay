@@ -183,11 +183,10 @@ Expected:
 
 In `tests/integration/manifest-contract.test.ts`, add:
 
-```ts
-it("pins Chrome 145 and the approved permission boundary", ...)
-it("does not request forbidden MVP permissions", ...)
-it("injects the static content script only on chatgpt.com", ...)
-```
+Add tests named:
+- `pins Chrome 145 and the approved permission boundary`: assert `manifest_version === 3`, `minimum_chrome_version === "145"`, and `permissions` deep-equals `["storage"]`.
+- `does not request forbidden MVP permissions`: assert none of `tabs`, `activeTab`, `scripting`, `<all_urls>`, `webRequest`, `debugger` appear.
+- `injects the static content script only on chatgpt.com`: assert host permission and every static content-script match deep-equal `["https://chatgpt.com/*"]`.
 
 The test reads `public/manifest.json`; do not create that file yet.
 
@@ -403,10 +402,26 @@ type AdapterReadyMessage = {
   sessionId?: string;
 };
 
+type AdapterInspectRequest = {
+  type: "adapter-inspect";
+};
+
+type AdapterInspectResult = {
+  type: "adapter-inspect-result";
+  snapshot: AdapterSnapshot;
+};
+
 type ArmResponseMessage = {
   type: "arm-response";
   expected: ExpectedResponse;
   authorizationRevision: number;
+};
+
+type ArmResponseResult = {
+  type: "arm-response-result";
+  ok: true;
+  sessionId: string;
+  waitId: string;
 };
 
 type InitialUserTurnObservedMessage = {
@@ -471,6 +486,13 @@ type BindExpectedUserTurnMessage = {
   authorizationRevision: number;
 };
 
+type BindExpectedUserTurnResult = {
+  type: "bind-expected-user-turn-result";
+  ok: true;
+  sessionId: string;
+  waitId: string;
+};
+
 type TranscriptInterferenceMessage = {
   type: "transcript-interference";
   sessionId: string;
@@ -482,6 +504,11 @@ type CancelTransferMessage = {
   type: "cancel-transfer";
   sessionId: string;
   transferId: string;
+};
+
+type CancelTransferResult = {
+  type: "cancel-transfer-result";
+  result: CancelSubmissionResult;
 };
 
 type RelayStatusRequest = { type: "relay-status" };
@@ -506,7 +533,10 @@ type RelayPreferencesSetResult =
 
 type RelayMessage =
   | AdapterReadyMessage
+  | AdapterInspectRequest
+  | AdapterInspectResult
   | ArmResponseMessage
+  | ArmResponseResult
   | InitialUserTurnObservedMessage
   | AssistantCompleteMessage
   | PreparePeerResponseMessage
@@ -514,8 +544,10 @@ type RelayMessage =
   | CommitTransferMessage
   | TransferCommittedMessage
   | BindExpectedUserTurnMessage
+  | BindExpectedUserTurnResult
   | TranscriptInterferenceMessage
   | CancelTransferMessage
+  | CancelTransferResult
   | RelayStatusRequest
   | RelayStatusResult
   | RelayStartRequest
@@ -539,6 +571,16 @@ Also produce:
 Add tests that pass concrete objects through `parseRelayMessage` and assert exact acceptance/rejection:
 
 ```text
+adapter-inspect:
+  request = {type:"adapter-inspect"}
+  response = {type:"adapter-inspect-result", snapshot: AdapterSnapshot}
+  expected = both accepted
+
+arm-response:
+  request contains ExpectedResponse + authorizationRevision
+  response = {type:"arm-response-result", ok:true, sessionId, waitId}
+  expected = both accepted
+
 assistant-complete:
   request = {type, sessionId, waitId, causedByUserMessageId, message}
   expected = accepted
@@ -549,6 +591,16 @@ assistant-complete missing waitId:
 transfer-committed:
   request includes userMessageId + conversationIdentity
   expected = accepted
+
+bind-expected-user-turn:
+  request includes sessionId + waitId + userMessageId + conversationIdentity + authorizationRevision
+  response includes same sessionId + waitId and ok:true
+  expected = both accepted
+
+cancel-transfer:
+  request includes sessionId + transferId
+  response wraps one exact CancelSubmissionResult variant
+  expected = both accepted
 
 relay-status:
   request = {type:"relay-status"}
@@ -644,7 +696,7 @@ Expected: FAIL because modules do not exist.
 
 Do not cache RelaySession as authoritative module-global state.
 
-- [ ] **Step 4: Implement `assertCurrentSession(...)`**
+- [ ] **Step 4: Implement `assertCurrentSession(current, expected)`**
 
 It validates persisted causal identifiers; it does not mutate.
 
@@ -1059,8 +1111,8 @@ Cover:
 - committed submission returns exact new `userMessageId` and resulting conversation identity;
 - inability to identify the created user message yields `relay-causality-ambiguous`;
 - cancel before commit removes staged relay text only when still extension-owned;
-- cancellation after commit returns `{status:"already-committed", ...}`;
-- ambiguous DOM state returns `{status:"unknown", ...}` or the matching fail-closed error;
+- cancellation after commit returns `{status:"already-committed", transferId, userMessageId, conversationIdentity}`;
+- ambiguous DOM state returns `{status:"unknown", transferId}` or the matching fail-closed error;
 - Review Focus #1: zero/multiple critical DOM targets fail closed.
 
 - [ ] **Step 2: Run RED**
@@ -1109,12 +1161,15 @@ git commit -m "feat: implement ChatGPT adapter lifecycle"
 
 ```ts
 interface RelayTransport {
-  inspect(tabId: number): Promise<AdapterSnapshot>;
+  inspect(
+    tabId: number,
+    message: AdapterInspectRequest
+  ): Promise<AdapterInspectResult>;
 
   armResponse(
     tabId: number,
     message: ArmResponseMessage
-  ): Promise<void>;
+  ): Promise<ArmResponseResult>;
 
   prepareSubmission(
     tabId: number,
@@ -1129,12 +1184,16 @@ interface RelayTransport {
   bindExpectedUserTurn(
     tabId: number,
     message: BindExpectedUserTurnMessage
-  ): Promise<void>;
+  ): Promise<BindExpectedUserTurnResult>;
 
   cancelSubmission(
     tabId: number,
     message: CancelTransferMessage
-  ): Promise<CancelSubmissionResult>;
+  ): Promise<CancelTransferResult>;
+}
+
+interface RelayTabsPort {
+  queryCurrentWindow(): Promise<readonly TabSnapshot[]>;
 }
 
 type TransitionExpectation = {
@@ -1151,14 +1210,40 @@ type TransitionDecision<T> = {
 };
 
 class RelayController {
+  constructor(deps: {
+    sessions: RelaySessionStore;
+    preferences: RelayPreferencesStore;
+    queue: TransitionQueue;
+    tabs: RelayTabsPort;
+    transport: RelayTransport;
+  });
+
+  getStatus(): Promise<RelayStatusSnapshot>;
+  getMaxTurns(): Promise<number>;
+  setMaxTurns(maxTurns: number): Promise<number>;
+
   start(): Promise<RelaySession>;
 
   handleInitialUserTurnObserved(
+    tabId: number,
     event: InitialUserTurnObservedMessage
   ): Promise<void>;
 
   handleAssistantComplete(
+    tabId: number,
     event: AssistantCompleteMessage
+  ): Promise<void>;
+
+  handleTranscriptInterference(
+    tabId: number,
+    event: TranscriptInterferenceMessage
+  ): Promise<void>;
+
+  handleTabRemoved(tabId: number): Promise<void>;
+
+  handleTabUpdated(
+    tabId: number,
+    changeInfo: { url?: string; splitViewId?: number }
   ): Promise<void>;
 
   withTransition<T>(
@@ -1190,7 +1275,7 @@ Cover:
 - pre-Start assistant cannot complete initial wait;
 - Start persists wait before transport arm acknowledgement is considered successful;
 - exact initial A user turn is persisted in `causedByUserMessageId`;
-- unbound A + first allowed prompt yields stable X → `reconcileConversationBinding(..., "first-allowed-prompt") -> bound(X)`;
+- unbound A + first allowed prompt yields stable X → `reconcileConversationBinding(currentBinding, "X", "first-allowed-prompt") -> bound(X)`;
 - unbound A + unrelated observed X during revalidation is not adopted;
 - assistant completion received before user-turn persistence is buffered/ignored until binding is confirmed;
 - second manual A user turn fails closed.
@@ -1238,14 +1323,17 @@ git commit -m "feat: start causal relay sessions"
 
 ```ts
 handleAssistantComplete(
+  tabId: number,
   event: AssistantCompleteMessage
 ): Promise<void>
 
 handleTransferPrepared(
+  tabId: number,
   event: TransferPreparedMessage
 ): Promise<void>
 
 handleTransferCommitted(
+  tabId: number,
   event: TransferCommittedMessage
 ): Promise<void>
 ```
@@ -1321,7 +1409,7 @@ git commit -m "feat: relay causally bound peer turns"
 - Never let stale async work restore waiting/dispatching state.
 
 **Interfaces:**
-- Consumes: Task 10 controller and Task 9 `RelayTransport.cancelSubmission()`.
+- Consumes: Task 10 controller and Task 9 `RelayTransport.cancelSubmission()`; controller unwraps `CancelTransferResult.result` into `CancellationReconciliationEvent.result`.
 - Produces:
 
 ```ts
@@ -1468,9 +1556,39 @@ type ServiceWorkerChromeApi = {
   };
 };
 
+interface RelayRuntimeControllerPort {
+  getStatus(): Promise<RelayStatusSnapshot>;
+  getMaxTurns(): Promise<number>;
+  setMaxTurns(maxTurns: number): Promise<number>;
+  start(): Promise<RelaySession>;
+  stop(sessionId: string): Promise<RelaySession>;
+
+  handleInitialUserTurnObserved(
+    tabId: number,
+    event: InitialUserTurnObservedMessage
+  ): Promise<void>;
+
+  handleAssistantComplete(
+    tabId: number,
+    event: AssistantCompleteMessage
+  ): Promise<void>;
+
+  handleTranscriptInterference(
+    tabId: number,
+    event: TranscriptInterferenceMessage
+  ): Promise<void>;
+
+  handleTabRemoved(tabId: number): Promise<void>;
+
+  handleTabUpdated(
+    tabId: number,
+    changeInfo: { url?: string; splitViewId?: number }
+  ): Promise<void>;
+}
+
 type ServiceWorkerRuntimeDeps = {
   chromeApi: ServiceWorkerChromeApi;
-  controller: RelayController;
+  controller: RelayRuntimeControllerPort;
 };
 
 type ContentChromeApi = {
@@ -1489,6 +1607,10 @@ type RuntimeHandle = {
   dispose(): void;
 };
 
+createChromeTabsPort(
+  tabs: ServiceWorkerChromeApi["tabs"]
+): RelayTabsPort
+
 createServiceWorkerRuntime(
   deps: ServiceWorkerRuntimeDeps
 ): RuntimeHandle
@@ -1500,8 +1622,12 @@ createContentRuntime(
 
 Runtime request/response behavior:
 - service worker receives a parsed `RelayMessage`;
+- `createChromeTabsPort().queryCurrentWindow()` calls `chrome.tabs.query({ currentWindow: true })` and maps results to Task 4 `TabSnapshot`;
 - for adapter-originated events it derives `tabId` only from `chrome.runtime.MessageSender.tab?.id`;
-- popup requests return the Task 2 exact result shapes;
+- popup `relay-status` returns `RelayStatusResult`;
+- popup `relay-start` returns `RelayStartResult` after `controller.start()` and `controller.getStatus()`;
+- popup `relay-stop` returns `RelayStopResult` after validating `sessionId`, calling `controller.stop(sessionId)`, and rereading status;
+- popup preference get/set returns the exact Task 2 preference result shapes;
 - unknown/malformed messages return `undefined` and cause no controller mutation;
 - `dispose()` removes every listener installed by that factory.
 
