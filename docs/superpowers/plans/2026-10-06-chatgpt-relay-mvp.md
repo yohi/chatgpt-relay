@@ -224,7 +224,9 @@ git commit -m "build: scaffold Chrome relay extension"
   - `RelaySession`
   - `RelayMessage`
   - `RelayFailureReason`
+  - `RelayStatusSnapshot`
   - `parseRelayMessage(value: unknown): RelayMessage | null`
+  - Popup/controller protocol messages fixed here: `relay-status`, `relay-status-result`, `relay-start`, `relay-stop`, `relay-preferences-get`, `relay-preferences-result`, `relay-preferences-set`.
 
 - [ ] **Step 1: Write failing protocol/type-boundary tests**
 
@@ -234,6 +236,7 @@ Add tests named:
 it("accepts assistant-complete only with sessionId waitId and message", ...)
 it("accepts transfer-committed with userMessageId and conversationIdentity", ...)
 it("rejects malformed or unknown message shapes", ...)
+it("validates popup status start stop and maxTurns preference messages", ...)
 it("enumerates conversation-changed relay-causality-ambiguous and message-identity-ambiguous", ...)
 ```
 
@@ -685,7 +688,7 @@ git commit -m "feat: implement ChatGPT adapter lifecycle"
 - Accept exactly one manual initial A user turn, persist `causedByUserMessageId`, then accept only its causally following assistant.
 
 **Interfaces:**
-- Consumes: Tasks 2–5 stores, queue, pair discovery, domain types.
+- Consumes: Tasks 2–5 domain/store/pair/identity contracts and Task 8 adapter transport semantics.
 - Produces:
   - `interface RelayTransport { inspect(tabId: number): Promise<AdapterSnapshot>; armResponse(tabId: number, expected: ExpectedResponse, authorizationRevision: number): Promise<void>; bindExpectedUserTurn(...): Promise<void>; ... }`
   - `class RelayController`
@@ -975,13 +978,8 @@ git commit -m "feat: wire Chrome relay runtimes"
 - Own no relay state.
 
 **Interfaces:**
-- Consumes: Task 2 messages and Task 13 runtime.
-- Produces popup message requests:
-  - `relay-status`
-  - `relay-start`
-  - `relay-stop`
-  - `relay-preferences-get/set`
-  if these names are not already present, add them to Task 2 protocol without altering domain semantics.
+- Consumes: Task 2 fixed popup/controller messages and `RelayStatusSnapshot`; Task 13 runtime routing.
+- Produces: no new protocol types. Popup code only sends/receives the Task 2 message shapes.
 
 - [ ] **Step 1: Write RED popup tests**
 
@@ -1012,7 +1010,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/popup src/shared/protocol.ts tests/integration/popup.test.ts
+git add src/popup tests/integration/popup.test.ts
 git commit -m "feat: add relay control popup"
 ```
 
@@ -1030,8 +1028,8 @@ git commit -m "feat: add relay control popup"
 
 **Responsibilities:**
 - Load `dist/` as an unpacked extension in Chromium.
-- Exercise extension runtime wiring against deterministic local ChatGPT-like fixture pages where real account/network state is not required.
-- Verify service-worker wake/reload behavior at browser level.
+- Exercise extension runtime wiring against deterministic ChatGPT-like fixture pages served under a `https://chatgpt.com/__relay-test/*` URL via Playwright request interception, so the production host/content-script match is unchanged.
+- Verify MV3 service-worker persistence/wake behavior at browser level using Playwright's Manifest V3 service-worker handle.
 - Keep real `chatgpt.com` account testing as manual smoke only.
 
 **Interfaces:**
@@ -1042,13 +1040,14 @@ git commit -m "feat: add relay control popup"
 
 At minimum:
 - extension loads with manifest contract intact;
-- content script activates only when fixture URL is mapped through the intended test harness and production matching logic remains chatgpt-only;
-- two simulated tab contexts can exchange protocol events through the real service worker;
-- worker restart/reload does not lose persisted session state;
-- stale continuation cannot overwrite a newer stop/error state;
-- transcript interference event stops a relay rather than forwarding unrelated completion.
+- navigating to `https://chatgpt.com/__relay-test/idle` is fulfilled from the local harness while the page URL remains `chatgpt.com`, and the production static content script injects;
+- a non-`chatgpt.com` page does not receive the content script;
+- popup page can query service-worker status through the real runtime message channel;
+- persisted `chrome.storage.session` data remains available after page reload and after the MV3 worker has idled/reawakened;
+- an in-flight `evaluate()` interrupted by worker suspension/restart is treated as an interruption and does not justify state replay;
+- transcript-interference evidence routed through the real runtime reaches fail-closed controller handling in the dependency-injected runtime integration path.
 
-Use a harness abstraction; do not weaken production host permissions to make tests easier.
+Use a harness abstraction; do not weaken production host permissions or add a test-only manifest permission to make tests easier. Native Split View relay itself remains the real-Chrome manual smoke responsibility in Task 16.
 
 - [ ] **Step 2: Run RED**
 
@@ -1058,7 +1057,16 @@ Expected: FAIL until harness/config exists.
 
 - [ ] **Step 3: Implement Playwright persistent-context extension harness**
 
-Use Chromium extension loading supported by Playwright. Do not add remote test services.
+Use Playwright's documented extension setup:
+- `chromium.launchPersistentContext(...)`
+- `channel: "chromium"`
+- bundled Chromium, not branded Chrome/Edge, because side-load flags are unavailable there;
+- `--disable-extensions-except=<dist>`
+- `--load-extension=<dist>`
+- retrieve the MV3 service worker from `context.serviceWorkers()` / `waitForEvent("serviceworker")`;
+- intercept `https://chatgpt.com/__relay-test/**` and fulfill it from `tests/integration/harness/chat-page.html`.
+
+Do not add remote test services.
 
 - [ ] **Step 4: Run GREEN**
 
