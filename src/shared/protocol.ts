@@ -532,7 +532,7 @@ function isRelayMessage(value: unknown): value is RelayMessage {
     case "relay-preferences-result":
       return isPositiveInteger(value["maxTurns"])
     case "relay-preferences-set":
-      return isPositiveInteger(value["maxTurns"])
+      return isNumber(value["maxTurns"])
     case "relay-preferences-set-result":
       return (
         isPositiveInteger(value["maxTurns"]) &&

@@ -311,6 +311,15 @@ describe("relay protocol parser", () => {
     expect(parseRelayMessage({ type: "relay-preferences-set", maxTurns: "10" })).toBeNull()
   })
 
+  it.each([0, -1, 1.5])(
+    "accepts structurally valid numeric maxTurns value %s for runtime validation",
+    (maxTurns) => {
+      const message = { type: "relay-preferences-set", maxTurns }
+
+      expect(parseRelayMessage(message)).toEqual(message)
+    },
+  )
+
   it("recognizes only the approved machine-readable failure reasons", () => {
     expect(parseRelayMessage({ type: "relay-start-result", ok: false, reason: "invented", status })).toBeNull()
   })
