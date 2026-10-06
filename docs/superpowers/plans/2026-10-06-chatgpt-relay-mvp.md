@@ -567,6 +567,7 @@ Use a single exported debounce constant, initially `COMPLETION_STABLE_MS = 500`,
 Cover:
 - no arm → no completion;
 - pre-baseline assistant ignored;
+- relay user message → expected causally following assistant = accepted;
 - automated wait without `causedByUserMessageId` buffers rather than emits;
 - exact relay user turn → following assistant accepted;
 - correct transfer label but wrong user ancestry rejected;
@@ -760,6 +761,7 @@ git commit -m "feat: start causal relay sessions"
 
 Cover:
 - A completion → persisted `PendingTransfer` before prepare side effect;
+- same tab + same `chatgpt.com` origin but different conversation identity → `conversation-changed`;
 - target conversation changed before prepare → `conversation-changed`;
 - target changes between prepare and commit → commit prohibited (Review Focus #2);
 - target wait persists `causedByTransferId` before commit;
