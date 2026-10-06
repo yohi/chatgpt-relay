@@ -1,0 +1,54 @@
+name: bootstrap-relay-toolchain
+on:
+  push:
+    branches:
+      - ci/chatgpt-relay-toolchain
+permissions:
+  contents: read
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+      - name: Pin npm
+        run: npm install -g npm@11.19.0
+      - name: Verify runtime
+        run: |
+          node --version
+          npm --version
+      - name: Install exact test toolchain
+        run: |
+          mkdir -p /tmp/relay-toolchain/project
+          cd /tmp/relay-toolchain/project
+          cat > package.json <<'JSON'
+          {
+            "private": true,
+            "devDependencies": {
+              "@playwright/test": "1.63.0",
+              "@types/chrome": "0.3.4",
+              "esbuild": "0.28.2",
+              "happy-dom": "20.14.5",
+              "typescript": "7.0.2",
+              "vitest": "5.0.3"
+            }
+          }
+          JSON
+          npm install --save-exact
+          npm exec vitest -- --version
+      - name: Bundle runtime and dependencies
+        run: |
+          NODE_BIN="$(readlink -f "$(command -v node)")"
+          NODE_ROOT="$(dirname "$(dirname "$NODE_BIN")")"
+          echo "$NODE_ROOT" > /tmp/relay-toolchain/node-root.txt
+          mkdir -p /tmp/relay-bundle
+          cp -a "$NODE_ROOT" /tmp/relay-bundle/node
+          cp -a /tmp/relay-toolchain/project /tmp/relay-bundle/project
+          tar -C /tmp -czf /tmp/relay-toolchain.tar.gz relay-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-toolchain
+          path: /tmp/relay-toolchain.tar.gz
+          retention-days: 1
