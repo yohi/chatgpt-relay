@@ -23,11 +23,12 @@ import type {
   PreparePeerResponseMessage,
   TransferCommittedMessage,
   TransferPreparedMessage,
+  TranscriptInterferenceMessage,
 } from "../shared/protocol"
 import { initializeConversationBinding, reconcileConversationBinding } from "../content/transcript-identity"
 import { assertCurrentSession } from "./session-store"
 import type { RelayPreferencesStore, RelaySessionStore } from "./session-store"
-import { discoverSplitPair, isPairStillValid } from "./split-view"
+import { discoverSplitPair, isPairStillValid, splitViewChangeInvalidatesPair } from "./split-view"
 import type { SplitPair, TabSnapshot } from "./split-view"
 import { TransitionQueue } from "./transition-queue"
 
@@ -128,6 +129,19 @@ function stoppedForMaxTurns(session: RelaySession): RelaySession {
 function stoppedByUser(session: RelaySession): RelaySession {
   const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = session
   return { ...retained, state: "stopped", stopReason: "stopped-by-user" }
+}
+
+type TerminalReason =
+  | "tab-closed"
+  | "invalid-navigation"
+  | "split-view-changed"
+  | "transcript-interference"
+  | "conversation-changed"
+  | "recovery-ambiguous"
+
+function terminalError(current: RelaySession, reason: TerminalReason): RelaySession {
+  const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = current
+  return { ...retained, state: "error", stopReason: reason }
 }
 
 export class RelayController {
@@ -268,6 +282,215 @@ export class RelayController {
         await this.failTransfer(current.id, pending.id, "recovery-ambiguous")
         return
     }
+  }
+
+  recoverActiveSession(): Promise<RelaySession | null> {
+    return this.deps.sessions.read()
+  }
+
+  async recoverTab(tabId: number): Promise<RelaySession | null> {
+    let current = await this.deps.sessions.read()
+    if (current === null) return null
+    if (tabId !== current.tabA && tabId !== current.tabB) return null
+    if (current.state === "stopped" || current.state === "error" || current.state === "stopping") {
+      return current
+    }
+
+    const pair = { splitViewId: current.splitViewId, tabA: current.tabA, tabB: current.tabB }
+    const tabs = await this.deps.tabs.queryCurrentWindow()
+    const afterTabQuery = await this.deps.sessions.read()
+    if (afterTabQuery === null || afterTabQuery.id !== current.id) return afterTabQuery
+    if (afterTabQuery.revision !== current.revision) return afterTabQuery
+    if (!isPairStillValid(pair, tabs)) return this.terminalize(current, "split-view-changed")
+
+    let inspection: AdapterInspectResult
+    try {
+      inspection = await this.deps.transport.inspect(tabId, { type: "adapter-inspect" })
+    } catch (error) {
+      if (!(error instanceof RelayTransportError)) throw error
+      return this.terminalize(current, this.recoveryFailureReason(error.failure.reason))
+    }
+    const afterInspect = await this.deps.sessions.read()
+    if (afterInspect === null || afterInspect.id !== current.id) return afterInspect
+    if (afterInspect.revision !== current.revision) return afterInspect
+    current = afterInspect
+
+    if (!inspection.snapshot.ready) return this.terminalize(current, "recovery-ambiguous")
+    const side = tabId === current.tabA ? "a" : "b"
+    const binding = targetBinding(current, side)
+    if (
+      (binding.state === "bound" && inspection.snapshot.conversationIdentity !== binding.conversationIdentity) ||
+      (binding.state === "unbound" &&
+        inspection.snapshot.conversationIdentity !== null &&
+        current.pendingTransfer?.targetTabId !== tabId)
+    ) {
+      return this.terminalize(current, "conversation-changed")
+    }
+
+    const pending = current.pendingTransfer
+    if (pending !== undefined && pending.targetTabId === tabId) {
+      if (pending.submissionState === "committed") {
+        if (
+          targetBinding(current, pending.targetTabId === current.tabA ? "a" : "b").state === "unbound" ||
+          pending.targetUserMessageId === undefined ||
+          current.expectedResponse?.causedByUserMessageId !== pending.targetUserMessageId ||
+          inspection.snapshot.latestUser?.messageId !== pending.targetUserMessageId
+        ) {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+      } else {
+        if (
+          pending.submissionState === "authorized" &&
+          current.expectedResponse?.causedByTransferId !== pending.id
+        ) {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+        let cancellation: CancelSubmissionResult
+        try {
+          const response = await this.deps.transport.cancelSubmission(tabId, {
+            type: "cancel-transfer",
+            sessionId: current.id,
+            transferId: pending.id,
+          })
+          if (response.type !== "cancel-transfer-result" || response.sessionId !== current.id) {
+            return this.terminalize(current, "recovery-ambiguous")
+          }
+          cancellation = response.result
+        } catch (error) {
+          if (!(error instanceof RelayTransportError)) throw error
+          return this.terminalize(current, this.recoveryFailureReason(error.failure.reason))
+        }
+
+        const afterCancel = await this.deps.sessions.read()
+        if (afterCancel === null || afterCancel.id !== current.id) return afterCancel
+        if (afterCancel.revision !== current.revision) return afterCancel
+        if (cancellation.transferId !== pending.id) {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+        if (cancellation.status !== "already-committed") {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+        if (pending.submissionState !== "authorized") {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+        if (
+          cancellation.userMessageId === null ||
+          cancellation.conversationIdentity === null ||
+          inspection.snapshot.latestUser?.messageId !== cancellation.userMessageId ||
+          inspection.snapshot.conversationIdentity !== cancellation.conversationIdentity
+        ) {
+          return this.terminalize(current, "recovery-ambiguous")
+        }
+        await this.handleTransferCommitted(tabId, {
+          type: "transfer-committed",
+          sessionId: current.id,
+          transferId: pending.id,
+          waitId: pending.targetWaitId,
+          userMessageId: cancellation.userMessageId,
+          conversationIdentity: cancellation.conversationIdentity,
+        })
+        const reconciled = await this.deps.sessions.read()
+        if (reconciled === null || reconciled.id !== current.id) return reconciled
+        current = reconciled
+      }
+    }
+
+    const expected = current.expectedResponse
+    if (expected === undefined) {
+      if (
+        current.state === "waiting-a" ||
+        current.state === "waiting-b" ||
+        current.state === "dispatching-a" ||
+        current.state === "dispatching-b"
+      ) {
+        return this.terminalize(current, "recovery-ambiguous")
+      }
+      return current
+    }
+    if (expected.tabId !== tabId) return current
+    if (
+      expected.causedByUserMessageId !== undefined &&
+      inspection.snapshot.latestUser?.messageId !== expected.causedByUserMessageId
+    ) {
+      return this.terminalize(current, "recovery-ambiguous")
+    }
+
+    try {
+      await this.deps.transport.armResponse(tabId, {
+        type: "arm-response",
+        expected,
+        authorizationRevision: current.revision,
+      })
+    } catch (error) {
+      if (!(error instanceof RelayTransportError)) throw error
+      return this.terminalize(current, this.recoveryFailureReason(error.failure.reason))
+    }
+    const afterArm = await this.deps.sessions.read()
+    if (afterArm === null || afterArm.id !== current.id) return afterArm
+    if (
+      afterArm.revision !== current.revision ||
+      afterArm.expectedResponse?.waitId !== expected.waitId
+    ) {
+      return afterArm
+    }
+    return afterArm
+  }
+
+  async handleTranscriptInterference(
+    tabId: number,
+    event: TranscriptInterferenceMessage,
+  ): Promise<void> {
+    const current = await this.deps.sessions.read()
+    if (
+      current === null ||
+      !isActiveState(current) ||
+      (tabId !== current.tabA && tabId !== current.tabB) ||
+      current.id !== event.sessionId ||
+      current.expectedResponse?.waitId !== event.waitId
+    ) {
+      return
+    }
+    await this.terminalize(current, "transcript-interference")
+  }
+
+  async handleTabRemoved(tabId: number): Promise<void> {
+    const current = await this.deps.sessions.read()
+    if (
+      current === null ||
+      !isActiveState(current) ||
+      (tabId !== current.tabA && tabId !== current.tabB)
+    ) {
+      return
+    }
+    await this.terminalize(current, "tab-closed")
+  }
+
+  async handleTabUpdated(
+    tabId: number,
+    changeInfo: { readonly url?: string; readonly splitViewId?: number },
+  ): Promise<void> {
+    const current = await this.deps.sessions.read()
+    if (
+      current === null ||
+      !isActiveState(current) ||
+      (tabId !== current.tabA && tabId !== current.tabB)
+    ) {
+      return
+    }
+    const pair = { splitViewId: current.splitViewId, tabA: current.tabA, tabB: current.tabB }
+    if (
+      Object.prototype.hasOwnProperty.call(changeInfo, "splitViewId") &&
+      splitViewChangeInvalidatesPair(pair, tabId, changeInfo.splitViewId)
+    ) {
+      await this.terminalize(current, "split-view-changed")
+      return
+    }
+    if (changeInfo.url === undefined) return
+    if (!/^https:\/\/chatgpt\.com(?:\/|$)/i.test(changeInfo.url)) {
+      await this.terminalize(current, "invalid-navigation")
+      return
+    }
+    await this.recoverTab(tabId)
   }
 
   private async reconcileCommittedStop(
@@ -955,6 +1178,41 @@ export class RelayController {
       { sessionId, revision: current.revision, transferId },
       (latest) => ({ nextSession: terminalFailure(latest, reason), result: undefined }),
     )
+  }
+
+  private async terminalize(
+    current: RelaySession,
+    reason: TerminalReason,
+  ): Promise<RelaySession | null> {
+    try {
+      return await this.withTransition(
+        { sessionId: current.id, revision: current.revision },
+        (latest) => {
+          const nextSession = terminalError(latest, reason)
+          return {
+            nextSession,
+            result: { ...nextSession, revision: latest.revision + 1 },
+          }
+        },
+      )
+    } catch (error) {
+      if (!(error instanceof RelayDomainError) || error.reason !== "invalid-session") throw error
+      return this.deps.sessions.read()
+    }
+  }
+
+  private recoveryFailureReason(reason: RelayFailureReason): TerminalReason {
+    switch (reason) {
+      case "tab-closed":
+      case "invalid-navigation":
+      case "split-view-changed":
+      case "transcript-interference":
+      case "conversation-changed":
+      case "recovery-ambiguous":
+        return reason
+      default:
+        return "recovery-ambiguous"
+    }
   }
 
   async withTransition<T>(
