@@ -324,11 +324,87 @@ describe("ChatGPTAdapter", () => {
     document.getElementById("transcript")?.append(assistant)
     await Promise.resolve()
 
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(false)
+    editedUser.click()
+    await Promise.resolve()
+
     const interference = received.find((event) => event.type === "transcript-interference")
     expect(interference).toMatchObject<Partial<TranscriptInterferenceMessage>>({
       type: "transcript-interference",
       sessionId: "session-1",
       waitId: "wait-1",
+    })
+    dispose()
+  })
+
+  it("treats visible regenerate control as inert until actually clicked", async () => {
+    await loadExistingConversation()
+    const adapter = new ChatGPTAdapter(document)
+    await adapter.armExpectedResponse({
+      ...expectedResponse,
+      causedByUserMessageId: "11111111-1111-4111-8111-111111111111",
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(false)
+    document.getElementById("regenerate-control")?.click()
+    await Promise.resolve()
+
+    expect(received.find((event) => event.type === "transcript-interference")).toMatchObject({
+      type: "transcript-interference",
+      reason: "regenerate",
+    })
+    dispose()
+  })
+
+  it("does not emit transcript interference for mutation controls without an armed wait", async () => {
+    await loadExistingConversation()
+    const adapter = new ChatGPTAdapter(document)
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+
+    document.getElementById("edit-control")?.click()
+    document.getElementById("regenerate-control")?.click()
+    await Promise.resolve()
+
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(false)
+    dispose()
+  })
+
+  it("stops routing mutation clicks after the active wait observer is disposed", async () => {
+    await loadExistingConversation()
+    const adapter = new ChatGPTAdapter(document)
+    await adapter.armExpectedResponse({
+      ...expectedResponse,
+      causedByUserMessageId: "11111111-1111-4111-8111-111111111111",
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+    dispose()
+
+    document.getElementById("edit-control")?.click()
+    document.getElementById("regenerate-control")?.click()
+    await Promise.resolve()
+
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(false)
+  })
+
+  it("detects causal user identity removal as structural interference", async () => {
+    await loadExistingConversation()
+    const adapter = new ChatGPTAdapter(document)
+    await adapter.armExpectedResponse({
+      ...expectedResponse,
+      causedByUserMessageId: "11111111-1111-4111-8111-111111111111",
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+    document.getElementById("user-turn")?.remove()
+    await Promise.resolve()
+
+    expect(received.find((event) => event.type === "transcript-interference")).toMatchObject({
+      type: "transcript-interference",
+      reason: "causality-ambiguous",
     })
     dispose()
   })

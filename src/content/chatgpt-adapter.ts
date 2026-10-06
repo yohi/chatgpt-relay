@@ -14,7 +14,12 @@ import type {
   TranscriptInterferenceMessage,
 } from "../shared/protocol"
 import { CompletionTracker, COMPLETION_STABLE_MS } from "./completion-tracker"
-import { findSubmitControl, inspectChatGptDom, readTranscript } from "./dom-contract"
+import {
+  classifyTranscriptMutationControl,
+  findSubmitControl,
+  inspectChatGptDom,
+  readTranscript,
+} from "./dom-contract"
 import type { TranscriptEntry } from "./dom-contract"
 import { hashNormalizedText, normalizeRelayText } from "./transcript-identity"
 
@@ -92,7 +97,7 @@ function mutationReason(reason: RelayFailureReason, entries: readonly Transcript
     }
     if (evidence?.includes("edit")) return "edit"
     if (evidence?.includes("regenerate")) return "regenerate"
-    return "branch"
+    return "causality-ambiguous"
   }
   return "causality-ambiguous"
 }
@@ -109,6 +114,8 @@ export class ChatGPTAdapter {
   private pendingEvents: AdapterEvent[] = []
   private mutationObserver: MutationObserver | null = null
   private completionTimer: number | null = null
+  private mutationClickListener: ((event: Event) => void) | null = null
+  private emittedInterference = false
 
   constructor(private readonly pageDocument: Document) {}
 
@@ -141,6 +148,7 @@ export class ChatGPTAdapter {
     this.boundUserMessageId = expected.causedByUserMessageId ?? null
     this.initialUserTurnEmitted = false
     this.emittedCompletion = false
+    this.emittedInterference = false
     this.baselineMessageIds = new Set(
       inspection.transcript.flatMap((entry) => (entry.stableDomId === null ? [] : [entry.stableDomId])),
     )
@@ -307,6 +315,13 @@ export class ChatGPTAdapter {
       this.observePage()
       this.scheduleCompletionCheck()
     })
+    this.mutationClickListener = (event) => {
+      const expected = this.expected
+      if (expected === null || this.emittedCompletion || this.emittedInterference) return
+      const mutation = classifyTranscriptMutationControl(this.pageDocument, event.target)
+      if (mutation !== null) this.emitInterference(expected, mutation)
+    }
+    this.pageDocument.addEventListener("click", this.mutationClickListener, true)
     this.mutationObserver.observe(this.pageDocument.body, {
       attributes: true,
       characterData: true,
@@ -334,12 +349,7 @@ export class ChatGPTAdapter {
       ) {
         return
       }
-      this.emit({
-        type: "transcript-interference",
-        sessionId: expected.sessionId,
-        waitId: expected.waitId,
-        reason: error.reason === "message-identity-ambiguous" ? "causality-ambiguous" : "branch",
-      })
+      this.emitInterference(expected, "causality-ambiguous")
       return
     }
 
@@ -352,12 +362,7 @@ export class ChatGPTAdapter {
         (entry) => entry.role === "user" && entry.stableDomId !== null && !this.baselineMessageIds.has(entry.stableDomId),
       )
       if (newUsers.length > 1) {
-        this.emit({
-          type: "transcript-interference",
-          sessionId: expected.sessionId,
-          waitId: expected.waitId,
-          reason: "unexpected-user-turn",
-        })
+        this.emitInterference(expected, "unexpected-user-turn")
       } else if (newUsers.length === 1 && inspection.conversationIdentity !== null) {
         const user = newUsers[0]
         if (user !== undefined && user.stableDomId !== null) {
@@ -375,12 +380,7 @@ export class ChatGPTAdapter {
 
     const observation = this.tracker.observe(transcript, inspection.generating)
     if (observation.kind === "interference") {
-      this.emit({
-        type: "transcript-interference",
-        sessionId: expected.sessionId,
-        waitId: expected.waitId,
-        reason: mutationReason(observation.reason, transcript),
-      })
+      this.emitInterference(expected, mutationReason(observation.reason, transcript))
     } else if (observation.kind === "complete" && !this.emittedCompletion) {
       this.emittedCompletion = true
       const userMessageId = this.boundUserMessageId
@@ -416,6 +416,20 @@ export class ChatGPTAdapter {
     }
   }
 
+  private emitInterference(
+    expected: ExpectedResponse,
+    reason: TranscriptInterferenceMessage["reason"],
+  ): void {
+    if (this.emittedInterference) return
+    this.emittedInterference = true
+    this.emit({
+      type: "transcript-interference",
+      sessionId: expected.sessionId,
+      waitId: expected.waitId,
+      reason,
+    })
+  }
+
   private scheduleCompletionCheck(): void {
     const view = this.pageDocument.defaultView
     if (view === null) return
@@ -429,6 +443,10 @@ export class ChatGPTAdapter {
   private stopObserving(): void {
     this.mutationObserver?.disconnect()
     this.mutationObserver = null
+    if (this.mutationClickListener !== null) {
+      this.pageDocument.removeEventListener("click", this.mutationClickListener, true)
+    }
+    this.mutationClickListener = null
     if (this.completionTimer !== null) this.pageDocument.defaultView?.clearTimeout(this.completionTimer)
     this.completionTimer = null
     this.eventHandler = null
