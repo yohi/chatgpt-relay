@@ -804,7 +804,7 @@ git commit -m "feat: relay causally bound peer turns"
 **Responsibilities:**
 - Implement the already-approved `stopping` contract without redesign.
 - Prevent new transfer creation/authorization after Stop acceptance.
-- Reconcile exactly one already-authorized transfer if it crossed commit.
+- Reconcile exactly one already-authorized transfer if it crossed the Design-defined **submission commit point** (the actual UI send activation implemented by Task 8).
 - Never let stale async work restore waiting/dispatching state.
 
 **Interfaces:**
