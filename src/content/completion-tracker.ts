@@ -26,6 +26,8 @@ export class CompletionTracker {
   private readonly baselineMessageIds = new Set<string>()
   private baselineAssistantId: string | null = null
   private causedByUserMessageId: string | null = null
+  private protectedMessageSequence: string[] | null = null
+  private observedCausalUserMessageId: string | null = null
   private boundConversationIdentity: string | null = null
   private bufferedCompletion: BufferedCompletion | null = null
   private stableCandidate: StableCandidate | null = null
@@ -36,6 +38,8 @@ export class CompletionTracker {
     this.baselineMessageIds.clear()
     this.baselineAssistantId = expected.baselineMessageId
     this.causedByUserMessageId = expected.causedByUserMessageId ?? null
+    this.observedCausalUserMessageId = null
+    this.protectedMessageSequence = null
     this.boundConversationIdentity = null
     this.bufferedCompletion = null
     this.stableCandidate = null
@@ -66,36 +70,68 @@ export class CompletionTracker {
     }
 
     this.causedByUserMessageId = input.userMessageId
+    this.observedCausalUserMessageId = input.userMessageId
     this.boundConversationIdentity = input.conversationIdentity
   }
 
   observe(snapshot: readonly TranscriptEntry[], generating: boolean): CompletionObservation {
     if (this.expected === null || this.emitted) return { kind: "pending" }
-    if (generating) {
-      this.stableCandidate = null
-      this.bufferedCompletion = null
-      return { kind: "pending" }
+    if (this.observedCausalUserMessageId !== null) {
+      const causalUsers = snapshot.filter(
+        (entry) => entry.role === "user" && entry.stableDomId === this.observedCausalUserMessageId,
+      )
+      if (causalUsers.length !== 1) {
+        this.clearPendingCompletion()
+        return { kind: "interference", reason: "transcript-interference" }
+      }
     }
 
     const targetUser = this.findExpectedUser(snapshot)
     if (targetUser.kind === "interference") {
-      this.bufferedCompletion = null
-      this.stableCandidate = null
+      this.clearPendingCompletion()
       return { kind: "interference", reason: targetUser.reason }
     }
     if (targetUser.kind === "pending") {
-      this.bufferedCompletion = null
-      this.stableCandidate = null
+      this.clearPendingCompletion()
       return { kind: "pending" }
     }
     if (targetUser.entry.stableDomId === null) {
       return { kind: "interference", reason: "message-identity-ambiguous" }
     }
     const userMessageId = targetUser.entry.stableDomId
+    if (
+      this.observedCausalUserMessageId !== null &&
+      this.observedCausalUserMessageId !== userMessageId
+    ) {
+      this.clearPendingCompletion()
+      return { kind: "interference", reason: "transcript-interference" }
+    }
+    this.observedCausalUserMessageId = userMessageId
+
+    const protectedSequence = snapshot.slice(targetUser.index).map((entry) => entry.stableDomId)
+    if (protectedSequence.some((messageId) => messageId === null)) {
+      this.clearPendingCompletion()
+      return { kind: "interference", reason: "message-identity-ambiguous" }
+    }
+    const sequence = protectedSequence.filter((messageId): messageId is string => messageId !== null)
+    if (
+      this.protectedMessageSequence !== null &&
+      !this.protectedMessageSequence.every((messageId, index) => sequence[index] === messageId)
+    ) {
+      this.clearPendingCompletion()
+      return { kind: "interference", reason: "transcript-interference" }
+    }
+    this.protectedMessageSequence = sequence
+
+    if (generating) {
+      this.stableCandidate = null
+      this.bufferedCompletion = null
+      return { kind: "pending" }
+    }
 
     const assistant = this.findFollowingAssistant(snapshot, targetUser.index)
     if (assistant.kind === "interference") {
-      this.bufferedCompletion = null
+      this.clearPendingCompletion()
       return { kind: "interference", reason: assistant.reason }
     }
     if (assistant.kind === "pending") {
@@ -115,12 +151,17 @@ export class CompletionTracker {
       return { kind: "pending" }
     }
     if (this.causedByUserMessageId !== userMessageId) {
-      this.bufferedCompletion = null
+      this.clearPendingCompletion()
       return { kind: "interference", reason: "unexpected-user-input" }
     }
 
     this.emitted = true
     return { kind: "complete", response }
+  }
+
+  private clearPendingCompletion(): void {
+    this.bufferedCompletion = null
+    this.stableCandidate = null
   }
 
   takeBufferedCompletion(waitId: string): AssistantResponse | null {

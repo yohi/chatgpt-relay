@@ -1,6 +1,9 @@
+import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { CompletionTracker } from "../../src/content/completion-tracker"
 import type { ExpectedResponse } from "../../src/shared/domain"
+import { readTranscript } from "../../src/content/dom-contract"
 import type { TranscriptEntry } from "../../src/content/dom-contract"
 
 const userBeforeWait: TranscriptEntry = {
@@ -45,6 +48,16 @@ const expectedResponse: ExpectedResponse = {
   causedByUserMessageId: "user-relay",
 }
 
+async function readCompletedFixture(): Promise<TranscriptEntry[]> {
+  const html = await readFile(
+    resolve(process.cwd(), "tests/content/fixtures/completed.html"),
+    "utf8",
+  )
+  document.body.innerHTML = html
+  window.history.replaceState(null, "", "/c/conversation-123")
+  return readTranscript(document)
+}
+
 describe("CompletionTracker", () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -84,6 +97,70 @@ describe("CompletionTracker", () => {
         textHash: expect.any(String),
       },
     })
+  })
+
+  it("accepts the completed DOM fixture while edit and regenerate controls are visible", async () => {
+    const transcript = await readCompletedFixture()
+    const user = transcript[0]
+    if (user === undefined || user.stableDomId === null) throw new Error("missing fixture user identity")
+    const tracker = new CompletionTracker()
+    tracker.arm(
+      { ...expectedResponse, baselineMessageId: null, causedByUserMessageId: user.stableDomId },
+      [user],
+    )
+
+    expect(tracker.observe(transcript, false)).toEqual({ kind: "pending" })
+    vi.advanceTimersByTime(500)
+    expect(tracker.observe(transcript, false)).toMatchObject({
+      kind: "complete",
+      response: { messageId: "44444444-4444-4444-8444-444444444444" },
+    })
+  })
+
+  it("fails closed when a previously observed causal user identity disappears", () => {
+    const tracker = new CompletionTracker()
+    tracker.arm(expectedResponse, [userBeforeWait, assistantBeforeWait])
+    expect(
+      tracker.observe([userBeforeWait, assistantBeforeWait, relayUser], false),
+    ).toEqual({ kind: "pending" })
+
+    expect(tracker.observe([userBeforeWait, assistantBeforeWait], false)).toEqual({
+      kind: "interference",
+      reason: "transcript-interference",
+    })
+  })
+
+  it("fails closed when a previously observed causal user identity is replaced", () => {
+    const tracker = new CompletionTracker()
+    tracker.arm(expectedResponse, [userBeforeWait, assistantBeforeWait])
+    tracker.observe([userBeforeWait, assistantBeforeWait, relayUser], false)
+    const replacement = { ...relayUser, stableDomId: "user-replacement" }
+
+    expect(
+      tracker.observe([userBeforeWait, assistantBeforeWait, replacement], false),
+    ).toEqual({ kind: "interference", reason: "transcript-interference" })
+  })
+
+  it("fails closed when a protected assistant identity is replaced", () => {
+    const tracker = new CompletionTracker()
+    tracker.arm(expectedResponse, [userBeforeWait, assistantBeforeWait])
+    const first = [userBeforeWait, assistantBeforeWait, relayUser, relayAssistant]
+    expect(tracker.observe(first, false)).toEqual({ kind: "pending" })
+    const replacement = { ...relayAssistant, stableDomId: "assistant-replacement" }
+
+    expect(
+      tracker.observe([userBeforeWait, assistantBeforeWait, relayUser, replacement], false),
+    ).toEqual({ kind: "interference", reason: "transcript-interference" })
+  })
+
+  it("fails closed when protected transcript order changes", () => {
+    const tracker = new CompletionTracker()
+    tracker.arm(expectedResponse, [userBeforeWait, assistantBeforeWait])
+    tracker.observe([userBeforeWait, assistantBeforeWait, relayUser, relayAssistant], false)
+
+    expect(
+      tracker.observe([userBeforeWait, assistantBeforeWait, relayAssistant, relayUser], false),
+    ).toEqual({ kind: "interference", reason: "transcript-interference" })
   })
 
   it("buffers an automated completion until controller user-turn binding", () => {
@@ -187,5 +264,17 @@ describe("CompletionTracker", () => {
     expect(tracker.observe(transcript, true)).toEqual({ kind: "pending" })
     vi.advanceTimersByTime(1000)
     expect(tracker.observe(transcript, true)).toEqual({ kind: "pending" })
+  })
+
+  it("treats same-ID assistant body changes during generation as normal streaming", () => {
+    const tracker = new CompletionTracker()
+    tracker.arm(expectedResponse, [userBeforeWait, assistantBeforeWait])
+    const initial = [userBeforeWait, assistantBeforeWait, relayUser, relayAssistant]
+    expect(tracker.observe(initial, true)).toEqual({ kind: "pending" })
+
+    const streamedAssistant = { ...relayAssistant, text: "synthetic assistant response grows" }
+    expect(
+      tracker.observe([userBeforeWait, assistantBeforeWait, relayUser, streamedAssistant], true),
+    ).toEqual({ kind: "pending" })
   })
 })
