@@ -63,6 +63,8 @@ The extension does not own the initial task prompt in the MVP.
 
 The Start action is valid only when the currently active tab is an eligible `chatgpt.com` tab in a valid two-tab Split View pair. This makes A/B assignment deterministic without depending on an unavailable or fragile notion of visual left/right position.
 
+The user's initial submission to A is the only manual transcript submission permitted while a relay session is active. After that initial A user turn is observed, any unexpected manual user submission, regenerate, edit, branch, or other transcript-changing operation during the active relay causes fail-closed termination rather than arbitration with the relay protocol.
+
 ## 5. Architecture
 
 The extension is divided into four responsibilities:
@@ -136,6 +138,12 @@ Conceptual protocol-facing types:
 ```ts
 type Side = "a" | "b";
 
+type TranscriptMessageIdentity = {
+  messageId: string;
+  role: "user" | "assistant";
+  textHash: string;
+};
+
 type AssistantResponse = {
   messageId: string;
   text: string;
@@ -146,6 +154,7 @@ type AdapterSnapshot = {
   ready: boolean;
   generating: boolean;
   conversationIdentity: string | null;
+  latestUser: TranscriptMessageIdentity | null;
   latestAssistant: AssistantResponse | null;
 };
 
@@ -153,6 +162,14 @@ type PreparedSubmission = {
   transferId: string;
   waitId: string;
   baselineMessageId: string | null;
+  conversationIdentity: string | null;
+};
+
+type CommittedSubmission = {
+  transferId: string;
+  waitId: string;
+  userMessageId: string;
+  conversationIdentity: string;
 };
 
 interface ChatGPTAdapter {
@@ -172,7 +189,15 @@ interface ChatGPTAdapter {
     transferId: string;
     waitId: string;
     authorizationRevision: number;
-  }): Promise<"committed">;
+  }): Promise<CommittedSubmission>;
+
+  bindExpectedUserTurn(input: {
+    sessionId: string;
+    waitId: string;
+    userMessageId: string;
+    conversationIdentity: string;
+    authorizationRevision: number;
+  }): Promise<void>;
 
   cancelSubmission(input: {
     sessionId: string;
@@ -188,20 +213,23 @@ It is responsible for:
 - Finding the prompt editor.
 - Determining whether the page is ready for interaction.
 - Detecting whether ChatGPT is currently generating.
-- Extracting the latest assistant-message identity and canonical text.
+- Reconstructing the current stable conversation identity when available.
+- Extracting stable user- and assistant-message transcript identities according to §9.
 - Capturing a response baseline before a wait is armed.
 - Installing completion observation before an automated target submission can begin.
-- Buffering a completed response for an armed `waitId` until the controller is ready to receive it.
-- Inserting relay text without overwriting unexpected user input.
+- Staging relay text without overwriting unexpected user input.
 - Triggering a normal UI submission.
+- Identifying the exact newly-created user transcript message produced by that submission.
+- Binding that user-message identity to the active transfer/wait before its assistant response may be emitted.
+- Buffering a completed response for an armed `waitId` until the controller has persisted the causal user-turn binding and is ready to receive it.
 - Defining and reporting the submission commit point.
 - Detecting stable generation completion.
-- Producing a stable message identity according to §9.
+- Detecting unexpected manual user turns, regenerate/edit/branch operations, or other transcript ancestry changes while a relay-owned response is expected.
 - Rejecting stale, duplicate, or mismatched session/transfer/wait commands.
 
 All selectors and ChatGPT-specific heuristics must remain inside this layer so DOM changes do not leak into relay orchestration.
 
-The adapter must never emit an `assistant-complete` event merely because a completed assistant node exists. It may emit completion only for an explicitly armed `ExpectedResponse` whose baseline and causal identifiers match.
+The adapter must never emit an `assistant-complete` event merely because a completed assistant node exists or because a known `causedByTransferId` can be copied into the event. For an automated wait, the observed assistant turn must be proven to belong to the exact relay-created user transcript turn persisted in that `ExpectedResponse`.
 
 ## 6. Split View pairing and browser baseline
 
@@ -277,10 +305,13 @@ type ExpectedResponse = {
   tabId: number;
   baselineMessageId: string | null;
   causedByTransferId?: string;
+  causedByUserMessageId?: string;
 };
 ```
 
 Every accepted completion is bound to exactly one `sessionId + waitId`.
+
+For an automated transfer, `causedByTransferId` is only the relay-protocol transfer label. It is not sufficient causal evidence by itself. Before any automated assistant completion can be accepted, the active `ExpectedResponse` must also contain the exact transcript identity of the relay-created user message in `causedByUserMessageId`.
 
 An `assistant-complete` event is valid only when:
 
@@ -288,10 +319,11 @@ An `assistant-complete` event is valid only when:
 2. its `waitId` equals the currently persisted `ExpectedResponse.waitId`;
 3. its sender tab and side match the persisted expected tab and side;
 4. its message is strictly after the persisted response baseline;
-5. for an automated target response, `causedByTransferId` matches the transfer that caused that wait;
-6. the message has not already been accepted for that wait.
+5. for an automated target response, both `causedByTransferId` and `causedByUserMessageId` match the persisted transfer and user-turn causal anchors;
+6. transcript ancestry proves that the assistant response belongs to the exact causal user turn defined below;
+7. the message has not already been accepted for that wait.
 
-A stale or unknown `waitId`, an old `sessionId`, or a mismatched transfer binding must not advance the state machine.
+A stale or unknown `waitId`, an old `sessionId`, a copied/echoed `causedByTransferId` without matching transcript ancestry, or a mismatched user-turn binding must not advance the state machine.
 
 ### 8.1 Initial A ordering
 
@@ -300,23 +332,28 @@ Start has the following normative ordering:
 ```text
 1. receive Start request
 2. validate the Split View pair and assign active tab = A
-3. confirm A adapter readiness
-4. confirm A is not currently generating; otherwise reject Start
-5. inspect A and capture the latest assistant message identity as baseline
-6. generate sessionId and waitId
-7. persist RelaySession + ExpectedResponse(A, waitId, baseline)
-8. arm A adapter with that exact ExpectedResponse
-9. confirm the arm succeeded
-10. report Start success to the popup/user
-11. user manually submits the initial task to A
-12. only an assistant message strictly after baseline may complete waitId
+3. confirm both adapters are ready and inspect both conversation identities
+4. initialize/persist side conversation bindings according to §9.1
+5. confirm A is not currently generating; otherwise reject Start
+6. inspect A and capture the latest assistant message identity as baseline
+7. generate sessionId and waitId
+8. persist RelaySession + ExpectedResponse(A, waitId, baseline)
+9. arm A adapter with that exact ExpectedResponse
+10. confirm the arm succeeded
+11. report Start success to the popup/user
+12. user manually submits the initial task to A
+13. the first allowed post-Start A user turn becomes the initial causal user turn
+14. if A was unbound, bind its first stable conversation identity only when that identity is causally associated with this allowed initial user turn
+15. only the assistant response belonging to that initial user turn and strictly after baseline may complete waitId
 ```
 
 An assistant response that existed before Start can therefore never satisfy the initial wait.
 
+Exactly one manual initial A user turn is permitted. A second manual user turn, regenerate/edit/branch operation, or ambiguous transcript mutation before the expected assistant response is resolved fails closed.
+
 ### 8.2 Automated target ordering
 
-For A → B or B → A, completion observation must exist before the UI submission can produce a target response.
+For A → B or B → A, completion observation must exist before the UI submission can produce a target response, and the response must be anchored to the exact relay-created user transcript turn.
 
 The normative protocol is:
 
@@ -327,37 +364,80 @@ controller:
   ↓
 target adapter prepareSubmission:
   validate editor/generation safety
+  reconstruct current conversation identity
   capture target latest-assistant baseline
   install/bind completion observation for target waitId
   stage the relay text without submitting it
-  return PreparedSubmission
+  return PreparedSubmission including current conversation identity
   ↓
 controller:
   re-read and revalidate persisted session
+  verify target conversation binding according to §9.1
   persist target ExpectedResponse(waitId, baseline, causedByTransferId)
   persist dispatch authorization revision
   ↓
 target adapter commitSubmission:
   revalidate session/transfer/wait identifiers
+  revalidate current conversation against the authorized binding
   cross the defined submission commit point
   trigger normal ChatGPT UI submission
-  return committed
-  response completion may occur at any point after commit;
-  if controller is not yet ready, adapter buffers it by waitId
+  identify the exact newly-created user transcript message for this relay submission
+  obtain/reconstruct its stable userMessageId
+  obtain/reconstruct the resulting stable conversation identity
+  return CommittedSubmission(userMessageId, conversationIdentity)
+  assistant completion may occur meanwhile but remains buffered by waitId
   ↓
 controller:
   re-read and revalidate persisted session
+  verify/adopt the side conversation binding according to §9.1
+  persist causedByUserMessageId on the same ExpectedResponse
   persist turn increment and waiting-target state
-  arm/confirm receipt path for the target ExpectedResponse
+  increment revision
   ↓
-target adapter:
-  if completion was already buffered for waitId, emit it immediately
+target adapter bindExpectedUserTurn:
+  bind the persisted userMessageId + conversationIdentity to waitId
+  verify transcript ancestry
+  if expected assistant already completed, emit it now
   otherwise emit it when completion conditions become true
 ```
 
-No implementation may use an ordering in which a valid target completion can be discarded solely because it arrived before the submission acknowledgement was processed.
+No implementation may accept an automated completion before the exact relay-created user message has been identified and persisted as the causal anchor.
 
-### 8.3 Completion evidence
+No implementation may use an ordering in which a valid target completion can be discarded solely because it completed before the submission acknowledgement or user-turn binding was processed.
+
+If the adapter cannot prove which newly-created user transcript message corresponds to the relay submission, or cannot safely derive its identity, the session enters `relay-causality-ambiguous` error.
+
+### 8.3 Transcript causal ancestry
+
+For the MVP, an assistant response belongs to an expected relay user turn only when the adapter can establish all of the following from the current transcript:
+
+1. the persisted `causedByUserMessageId` identifies the exact expected user message;
+2. the candidate assistant message occurs in the same persisted conversation binding;
+3. the candidate assistant is the assistant turn causally following that user message in the active transcript branch;
+4. no other user message was inserted between the expected user message and candidate assistant;
+5. no unexpected regenerate, edit, branch, or equivalent transcript-rewriting operation invalidated that ancestry.
+
+If the DOM does not provide an explicit parent/turn relationship, stable transcript ordering may be used only when it proves the same invariants unambiguously.
+
+A candidate assistant event that merely carries the correct `sessionId`, `waitId`, or `causedByTransferId` but is not causally after the persisted relay-created user message is rejected.
+
+### 8.4 Active-relay manual interaction policy
+
+The only permitted manual transcript submission during an active relay session is the initial A prompt described in §8.1.
+
+After that initial user turn:
+
+- an unexpected manual user submission;
+- regenerate;
+- edit;
+- branch/conversation-fork action;
+- or another transcript mutation that changes expected turn ancestry
+
+causes fail-closed termination.
+
+The MVP does not arbitrate or merge manual turns with relay-owned turns.
+
+### 8.5 Completion evidence
 
 For the armed response, the adapter considers generation complete only after all required conditions hold:
 
@@ -366,44 +446,103 @@ For the armed response, the adapter considers generation complete only after all
 3. ChatGPT is no longer in its active generation state;
 4. the response content remains stable for a debounce interval;
 5. the response identity satisfies §9;
-6. the response has not already been emitted for that `waitId`.
+6. transcript causal ancestry satisfies §8.3;
+7. the response has not already been emitted for that `waitId`.
 
 A `MutationObserver` may be used as a change signal, but a DOM mutation alone is never completion evidence.
 
 The implementation should prefer multiple independent completion signals over a single fragile selector.
 
-## 9. Duplicate suppression and message identity
+## 9. Transcript message identity and conversation binding
 
-Message identity is distinct from content identity. Two different assistant turns are allowed to contain exactly the same text and must still be relayed independently.
+Message identity is distinct from content identity. Two different transcript turns are allowed to contain exactly the same text and must still have distinct identities.
 
-The conceptual response shape is:
+The conceptual identity shapes are:
 
 ```ts
+type TranscriptMessageIdentity = {
+  messageId: string;
+  role: "user" | "assistant";
+  textHash: string;
+};
+
 type AssistantResponse = {
   messageId: string;
   text: string;
   textHash: string;
 };
+
+type ConversationBinding =
+  | { state: "unbound" }
+  | { state: "bound"; conversationIdentity: string };
 ```
 
 `textHash` is a deterministic hash of normalized relay text. It is evidence about content, not by itself a persistent message identity.
 
-The adapter uses this identity precedence:
+### 9.1 Conversation binding
+
+The RelaySession owns one persisted conversation binding for each side.
+
+At Start:
+
+- if an adapter can reconstruct a stable conversation identity for a side, that side is immediately persisted as `bound(conversationIdentity)`;
+- only a genuinely new/unidentified ChatGPT conversation may start as `unbound`.
+
+An `unbound` side may transition to `bound` exactly once, and only when the adapter can causally associate the newly appeared stable conversation identity with that side's first allowed prompt submission:
+
+- the manual initial A user turn; or
+- the first relay-owned automated submission to that side.
+
+A stable identity that appears because the user manually navigated to another conversation is not adoptable.
+
+Once a side is `bound`, its `conversationIdentity` is immutable for the lifetime of that relay session.
+
+For every state-mutating observation, wait arm, submission preparation, submission commit, completion acceptance, and reload/resynchronization, the controller compares the adapter's current conversation identity with the persisted side binding.
+
+The required behavior is:
+
+```text
+bound(X) + current X
+  → valid
+
+bound(X) + current Y
+  → conversation-changed error
+
+bound(X) + current null/unknown
+  → error if identity is required to prove the operation safely
+
+unbound + no stable identity
+  → remain unbound only until the first allowed prompt can establish identity
+
+unbound + stable identity causally produced by the first allowed prompt
+  → persist bound(identity) exactly once
+
+unbound + stable identity from unrelated navigation/manual replacement
+  → conversation-changed error
+```
+
+The controller must revalidate the target conversation binding both before `prepareSubmission()` authorization and again before `commitSubmission()` may cross the submission commit point.
+
+A same-tab, same-origin, same-Split-View navigation from ChatGPT conversation X to conversation Y never causes automatic adoption of Y.
+
+### 9.2 User and assistant message identity precedence
+
+For both user and assistant transcript messages, the adapter uses this identity precedence:
 
 1. **Verified stable DOM identity.** If ChatGPT exposes a per-message identifier that the adapter can verify as stable for the same transcript message across a normal re-read/reload, `messageId` uses that identifier.
 2. **Deterministic transcript fallback.** If no verified stable DOM identifier exists, `messageId` is derived from:
-   - stable conversation identity,
-   - stable assistant-message ordinal in the reconstructed transcript,
+   - the persisted stable conversation identity,
+   - the stable role-specific message ordinal in the reconstructed transcript,
    - normalized content hash.
 3. **Ambiguous reconstruction.** If reload or DOM state does not allow the conversation identity and transcript ordinal to be reconstructed safely, the adapter must not fall back to content hash alone. Recovery stops with `message-identity-ambiguous`.
 
-`tabId + contentHash`, content hash alone, or another content-only key must never be used as persistent duplicate identity.
+`tabId + contentHash`, content hash alone, or another content-only key must never be used as persistent message identity.
 
-The assistant ordinal counts assistant messages in stable transcript order, not unique content values. Therefore two separate assistant messages containing `OK` have different identities even though their `textHash` values are equal.
+The role-specific ordinal counts transcript messages of that role in stable transcript order, not unique content values. Therefore two separate assistant messages containing `OK`, or two separate user messages containing the same relay text, still have different identities.
 
-The Relay Controller records the accepted message identity associated with each consumed `ExpectedResponse` and rejects a second acceptance of the same wait/message pair.
+The Relay Controller records the accepted assistant message identity associated with each consumed `ExpectedResponse`, plus the causal user-message identity for automated waits.
 
-After reload, an already accepted visible assistant message must reconstruct to the same `messageId`; if that cannot be proven, the relay fails closed instead of guessing.
+After reload, an already accepted visible message must reconstruct to the same `messageId`; if that cannot be proven, the relay fails closed instead of guessing.
 
 ## 10. State machine, linearization, and transfer protocol
 
@@ -428,6 +567,7 @@ type PendingTransfer = {
   payloadHash: string;
   targetWaitId: string;
   targetBaselineMessageId?: string | null;
+  targetUserMessageId?: string;
   authorizationRevision?: number;
   submissionState: "preparing" | "authorized" | "committed";
 };
@@ -438,6 +578,8 @@ type RelaySession = {
   splitViewId: number;
   tabA: number;
   tabB: number;
+  conversationA: ConversationBinding;
+  conversationB: ConversationBinding;
   state: RelayState;
   turn: number;
   maxTurns: number;
@@ -488,11 +630,15 @@ An in-memory queue or mutex may serialize handlers during one service-worker lif
 
 When a completed source response is accepted, the controller:
 
-1. verifies that creating another transfer would not exceed `maxTurns`;
-2. creates and persists `PendingTransfer`;
-3. moves to the corresponding `dispatching-*` state;
-4. increments `revision`;
-5. only then instructs the target adapter to prepare/submit according to §8.2.
+1. verifies the source conversation binding and expected user-turn ancestry;
+2. verifies that creating another transfer would not exceed `maxTurns`;
+3. creates and persists `PendingTransfer`;
+4. moves to the corresponding `dispatching-*` state;
+5. increments `revision`;
+6. revalidates the target conversation binding;
+7. only then instructs the target adapter to prepare/submit according to §8.2.
+
+Before the submission commit point, the controller revalidates the target conversation binding again. A changed, replaced, or ambiguously unidentified bound conversation cannot receive the relay submission.
 
 A side effect must never be the first durable evidence that a transfer exists.
 
@@ -588,6 +734,7 @@ type RelayMessage =
       sessionId: string;
       waitId: string;
       causedByTransferId?: string;
+      causedByUserMessageId?: string;
       message: AssistantResponse;
     }
   | {
@@ -604,6 +751,7 @@ type RelayMessage =
       transferId: string;
       waitId: string;
       baselineMessageId: string | null;
+      conversationIdentity: string | null;
     }
   | {
       type: "commit-transfer";
@@ -617,6 +765,22 @@ type RelayMessage =
       sessionId: string;
       transferId: string;
       waitId: string;
+      userMessageId: string;
+      conversationIdentity: string;
+    }
+  | {
+      type: "bind-expected-user-turn";
+      sessionId: string;
+      waitId: string;
+      userMessageId: string;
+      conversationIdentity: string;
+      authorizationRevision: number;
+    }
+  | {
+      type: "transcript-interference";
+      sessionId: string;
+      waitId: string;
+      reason: "unexpected-user-turn" | "regenerate" | "edit" | "branch" | "causality-ambiguous";
     }
   | {
       type: "cancel-transfer";
@@ -633,13 +797,13 @@ All inbound messages must be structurally validated.
 
 The service worker must derive and verify the sender tab from Chrome's message sender metadata rather than trusting a page-provided `tabId` as authority.
 
-Before accepting an adapter event, the controller revalidates the latest persisted `sessionId`, `revision`, `waitId`, and/or `transferId` required by that event.
+Before accepting an adapter event, the controller revalidates the latest persisted `sessionId`, `revision`, `waitId`, `transferId`, causal user-message identity, and side conversation binding required by that event.
 
 The content script must reject commands that do not belong to its intended tab/session or that replay an already-consumed transfer/wait authorization.
 
-An `assistant-complete` message without the currently armed `sessionId + waitId` is never a relay event, even if the observed DOM message is new.
+For an automated wait, an `assistant-complete` message without the currently persisted `sessionId + waitId + causedByUserMessageId` and matching transcript ancestry is never a relay completion, even if it carries the correct `causedByTransferId`.
 
-## 14. User-input protection
+## 14. User-input and transcript-interference protection
 
 The extension must not silently overwrite user-composed text.
 
@@ -649,6 +813,10 @@ If unexpected user text is already present, the relay stops with an actionable e
 
 The extension must also refuse to submit while the target ChatGPT tab is already generating a response.
 
+The manual initial A prompt defined in §8.1 is explicitly allowed. After that prompt, the active relay owns the expected transcript turns until the session stops.
+
+If either adapter detects an unexpected manual user submission, regenerate, edit, branch, or another transcript mutation that can change causal ancestry, it emits transcript-interference evidence and the controller fails closed. The MVP does not attempt to merge, queue, or arbitrate manual user activity with relay activity.
+
 ## 15. Failure handling
 
 The relay stops safely when any of the following occurs:
@@ -656,11 +824,17 @@ The relay stops safely when any of the following occurs:
 - One paired tab is closed.
 - One paired tab navigates away from an allowed ChatGPT origin.
 - Either paired tab loses or changes the persisted Split View relationship.
+- A bound side's current ChatGPT conversation identity differs from its persisted binding.
+- A bound side's conversation identity becomes unavailable when identity is required to prove a wait, submission, or recovery safely.
+- An unbound side presents a stable conversation identity that cannot be causally attributed to its first allowed prompt.
 - The prompt editor cannot be identified.
 - The adapter cannot determine generation state safely.
 - A Start request finds A already generating.
 - The target prompt contains unexpected user text.
 - Submission cannot be prepared or committed safely.
+- The exact relay-created user transcript message cannot be identified after commit.
+- The expected assistant's causal ancestry to the persisted user turn cannot be proven.
+- An unexpected manual user turn, regenerate, edit, branch, or equivalent transcript mutation occurs after the allowed initial A prompt.
 - A stale or invalid session/revision/wait/transfer command is received where recovery cannot safely ignore it.
 - The active response cannot be identified reliably.
 - Message identity cannot be reconstructed safely after reload.
@@ -668,7 +842,7 @@ The relay stops safely when any of the following occurs:
 - `maxTurns` is reached.
 - The user presses Stop.
 
-The controller records a machine-readable stop/error reason and exposes a user-readable explanation through the popup.
+The controller records a machine-readable stop/error reason and exposes a user-readable explanation through the popup. Relevant protocol reasons include `relay-causality-ambiguous`, `conversation-changed`, and `message-identity-ambiguous`.
 
 No automatic retry may create a duplicate user-visible ChatGPT message.
 
@@ -685,13 +859,17 @@ After reload:
 1. The content script announces readiness.
 2. The controller enters the serialized transition path and loads the latest persisted session.
 3. The controller verifies that the tab still belongs to the persisted active pair.
-4. The adapter reconstructs conversation identity, transcript message identities, latest assistant identity, current generation state, and any evidence relevant to a persisted `ExpectedResponse` or `PendingTransfer`.
-5. An already accepted visible message must reconstruct to the same `messageId`; it is not emitted again.
-6. If a persisted wait exists, the adapter may re-arm only that same `sessionId + waitId` against its persisted baseline; it must not synthesize a new wait around the latest DOM response.
-7. A dispatch interrupted after visible submission but before acknowledgement is reconciled as submitted only when target-page evidence is unambiguous.
-8. Relay resumes only if message identity, wait identity, transfer state, and Split View pairing can all be reconciled without ambiguity.
+4. The adapter reconstructs current conversation identity, transcript user/assistant message identities, latest assistant identity, current generation state, and any evidence relevant to a persisted `ExpectedResponse` or `PendingTransfer`.
+5. The controller compares the reconstructed conversation identity with that side's persisted `ConversationBinding`.
+6. For `bound(X)`, only current identity X may resume; Y, null, or ambiguous identity causes `conversation-changed`/fail-closed handling when safe identity cannot be proven.
+7. An `unbound` binding may be adopted only under the one-time causal adoption rule in §9.1; reload alone is never authority to adopt an arbitrary conversation.
+8. An already accepted visible message must reconstruct to the same `messageId`; it is not emitted again.
+9. If a persisted wait exists, the adapter may re-arm only that same `sessionId + waitId` against its persisted baseline and causal user-message identity; it must not synthesize a new wait around the latest DOM response.
+10. If an automated wait already has `causedByUserMessageId`, the adapter must reconstruct that exact user transcript turn and prove the candidate assistant ancestry from it.
+11. A dispatch interrupted after visible submission but before acknowledgement is reconciled as submitted only when target-page evidence includes the same conversation binding and relay-created user-message identity unambiguously.
+12. Relay resumes only if conversation binding, message identity, wait identity, user-turn causality, transfer state, and Split View pairing can all be reconciled without ambiguity.
 
-If transcript ordering/ordinal cannot be reconstructed safely, if the same message cannot be identified across reload, or if transfer commit status is ambiguous, the session transitions to `error`.
+If transcript ordering/ordinal cannot be reconstructed safely, if the same message cannot be identified across reload, if conversation identity differs from a persisted binding, if causal user-turn ancestry cannot be proven, or if transfer commit status is ambiguous, the session transitions to `error`.
 
 Content hash alone is never sufficient recovery evidence.
 
@@ -799,13 +977,23 @@ Cover at minimum:
 - valid initial A wait baseline creation and arm before Start succeeds;
 - a pre-Start existing assistant response is not accepted as the initial response;
 - Start is rejected when A is already generating;
+- the initial A manual prompt remains permitted and is the only manual user turn allowed by the active relay;
 - valid A → B and B → A transitions;
-- target completion occurring before transfer commit acknowledgement processing is buffered and later accepted, not lost;
+- relay-created target user message → causally following assistant = accepted;
+- relay-created target user message → unexpected manual user message → assistant = error, not relay completion;
+- unexpected regenerate/edit/branch evidence during an expected relay turn fails closed when causal ancestry cannot be proven;
+- an `assistant-complete` event that merely echoes the correct `causedByTransferId` but is not causally after the persisted relay user message is rejected;
+- target completion occurring before transfer commit acknowledgement/user-turn binding processing is buffered and later accepted, not lost;
 - stale `waitId` completion does not advance a later turn;
 - old `sessionId` completion does not advance a later session;
 - unexpected-side event rejection;
 - duplicate response rejection for the same wait/message;
 - two distinct assistant messages with identical text (for example `OK`, then `OK`) are both accepted exactly once;
+- a stable bound conversation remains unchanged and relay continues;
+- same tab + same `chatgpt.com` origin + different conversation identity causes error;
+- target conversation change between waits prohibits prepare/commit;
+- new-chat `unbound → bound` occurs once only when causally associated with the first allowed prompt;
+- later conversation identity change after binding is rejected;
 - `maxTurns` cannot race with creation of a new `PendingTransfer`;
 - Stop vs assistant-complete race;
 - Stop vs transfer acknowledgement race;
@@ -818,7 +1006,7 @@ Cover at minimum:
 - invalid navigation;
 - `splitViewId` becoming `SPLIT_VIEW_ID_NONE`;
 - `splitViewId` changing through `tabs.onUpdated`;
-- service-worker reconstruction from persisted `revision`, wait, and transfer state.
+- service-worker reconstruction from persisted `revision`, wait, transfer, conversation, and causal-user-turn state.
 
 ### 19.2 ChatGPT Adapter and identity tests
 
@@ -828,16 +1016,23 @@ Cover at minimum:
 
 - prompt editor discovery;
 - generation-state detection;
-- assistant-message extraction;
+- user- and assistant-message extraction;
 - stream-to-stable completion detection;
 - no completion emission without an armed wait;
 - baseline excludes an already existing assistant response;
-- response completion can be buffered until its armed wait is consumable;
+- exact relay-created user transcript message is identified after submission;
+- response completion can be buffered until its causal user-turn binding is persisted/armed;
+- unexpected intervening user turn invalidates the expected assistant ancestry;
+- regenerate/edit/branch evidence invalidates ancestry when a unique causal path cannot be proven;
 - distinct same-text messages receive distinct `messageId` values;
 - accepted message → reload → same visible message reconstructs to the same identity and is not re-emitted;
 - unsafe fallback identity reconstruction returns an ambiguity error instead of content-hash guessing;
+- same conversation identity survives reload and can resume;
+- different conversation identity after reload fails closed;
+- new-chat identity can be adopted once after the first allowed prompt and not replaced later;
 - refusal to overwrite user input;
 - submission preparation and exact commit-point reporting;
+- target conversation binding is checked during preparation and again before commit;
 - cancellation before commit vs already-committed reporting;
 - duplicate transfer command rejection;
 - submission failure handling;
@@ -866,27 +1061,34 @@ Manual smoke testing against `chatgpt.com` is still required before release beca
 The MVP is accepted when all of the following are demonstrated:
 
 1. On Chrome 145+, with two logged-in ChatGPT tabs in one native Split View, Start identifies a valid pair and assigns the active tab as A.
-2. Start succeeds only after A readiness, non-generating state, baseline capture, persisted `ExpectedResponse`, and wait arming are confirmed.
-3. An assistant response that existed before Start is never relayed as the initial A response.
-4. After the user manually submits an initial task to A, only the assistant message after the persisted baseline can satisfy the initial `waitId`.
-5. A completed response is accepted only when `sessionId + waitId` and, when applicable, `causedByTransferId` match persisted causal state.
-6. A target response that completes before the transfer acknowledgement is processed is not lost.
-7. Partial streamed text is never submitted to the peer.
-8. Two distinct assistant messages with identical normalized text are both relayable exactly once.
-9. Reloading an already accepted visible message does not relay it again; ambiguous identity reconstruction fails closed.
-10. Reaching `maxTurns` prevents creation/authorization of the next transfer.
-11. Once Stop enters `stopping`, no new transfer is created or authorized.
-12. An already-authorized in-flight submission is cancelled before commit when provably possible, otherwise reconciled at most once; it never causes a further peer transfer after Stop.
-13. After the popup reports `stopped`, no automatic submission may begin.
-14. User text already present in the target editor is never overwritten.
-15. Closing, navigating, or removing either paired tab from the persisted Split View stops/fails the session safely.
-16. Service-worker suspension does not lose `revision`, `ExpectedResponse`, `PendingTransfer`, or accepted-message state.
-17. A stale async continuation cannot overwrite a newer `stopping`, `stopped`, or `error` state.
-18. A DOM recognition failure stops the relay instead of guessing.
-19. An interrupted dispatch is never blindly resubmitted when prior submission status is ambiguous.
-20. The relay controller contains no ChatGPT-specific DOM selectors.
-21. The packaged extension requests only `"storage"` plus the `https://chatgpt.com/*` host/content-script scope defined in §17; it does not request `tabs`, `activeTab`, `scripting`, `<all_urls>`, `webRequest`, or `debugger`.
-22. `chrome.tabs.createSplit()` remains outside the MVP.
+2. Start persists A/B conversation bindings when stable identities exist and allows `unbound` only for a genuinely unidentified new conversation.
+3. Start succeeds only after A readiness, non-generating state, baseline capture, persisted `ExpectedResponse`, and wait arming are confirmed.
+4. An assistant response that existed before Start is never relayed as the initial A response.
+5. The user's first post-Start A user turn is permitted as the initial prompt; later unexpected manual transcript intervention fails closed.
+6. For automated transfers, a completion is accepted only after the exact relay-created user transcript message has been identified and persisted in `causedByUserMessageId`.
+7. Correct `sessionId + waitId + causedByTransferId` without matching causal user-turn ancestry is insufficient and is rejected.
+8. A target response that completes before transfer acknowledgement/user-turn binding processing is not lost.
+9. An unexpected manual user turn, regenerate, edit, branch, or ambiguous ancestry between relay prompt and expected assistant produces error rather than relay completion.
+10. Partial streamed text is never submitted to the peer.
+11. Two distinct assistant messages with identical normalized text are both relayable exactly once.
+12. Reloading an already accepted visible message does not relay it again; ambiguous identity reconstruction fails closed.
+13. Once a side is `bound(X)`, same-tab navigation to conversation Y or loss of provable identity cannot be automatically adopted and causes error.
+14. An `unbound` new-chat side may adopt one stable conversation identity only when causally associated with its first allowed prompt; the binding is immutable afterward.
+15. Target conversation binding is revalidated before submission preparation and again before the submission commit point.
+16. Reload/resynchronization resumes only when reconstructed conversation identity matches the persisted side binding and causal user-turn ancestry is preserved.
+17. Reaching `maxTurns` prevents creation/authorization of the next transfer.
+18. Once Stop enters `stopping`, no new transfer is created or authorized.
+19. An already-authorized in-flight submission is cancelled before commit when provably possible, otherwise reconciled at most once; it never causes a further peer transfer after Stop.
+20. After the popup reports `stopped`, no automatic submission may begin.
+21. User text already present in the target editor is never overwritten.
+22. Closing, navigating away from the allowed origin, changing conversation identity, or removing either paired tab from the persisted Split View stops/fails the session safely.
+23. Service-worker suspension does not lose `revision`, conversation bindings, `ExpectedResponse`, causal user-message identity, `PendingTransfer`, or accepted-message state.
+24. A stale async continuation cannot overwrite a newer `stopping`, `stopped`, or `error` state.
+25. A DOM recognition failure stops the relay instead of guessing.
+26. An interrupted dispatch is never blindly resubmitted when prior submission status is ambiguous.
+27. The relay controller contains no ChatGPT-specific DOM selectors.
+28. The packaged extension requests only `"storage"` plus the `https://chatgpt.com/*` host/content-script scope defined in §17; it does not request `tabs`, `activeTab`, `scripting`, `<all_urls>`, `webRequest`, or `debugger`.
+29. `chrome.tabs.createSplit()` remains outside the MVP.
 
 ## 21. Future phases
 
