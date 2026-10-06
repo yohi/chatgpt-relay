@@ -374,6 +374,8 @@ type CancelSubmissionResult =
 type RelayFailureReason =
   | "pair-invalid"
   | "adapter-not-ready"
+  | "adapter-command-failed"
+  | "adapter-transport-failed"
   | "generation-in-progress"
   | "dom-contract-ambiguous"
   | "conversation-changed"
@@ -421,6 +423,23 @@ The complete cross-context message union is:
 type AdapterReadyMessage = {
   type: "adapter-ready";
   sessionId?: string;
+};
+
+type AdapterCommandName =
+  | "adapter-inspect"
+  | "arm-response"
+  | "prepare-peer-response"
+  | "commit-transfer"
+  | "bind-expected-user-turn"
+  | "cancel-transfer";
+
+type AdapterCommandFailure = {
+  type: "adapter-command-failure";
+  command: AdapterCommandName;
+  sessionId?: string;
+  transferId?: string;
+  waitId?: string;
+  reason: RelayFailureReason;
 };
 
 type AdapterInspectRequest = {
@@ -532,6 +551,30 @@ type CancelTransferResult = {
   result: CancelSubmissionResult;
 };
 
+type AdapterInspectResponse =
+  | AdapterInspectResult
+  | AdapterCommandFailure;
+
+type ArmResponseResponse =
+  | ArmResponseResult
+  | AdapterCommandFailure;
+
+type PreparePeerResponseResponse =
+  | TransferPreparedMessage
+  | AdapterCommandFailure;
+
+type CommitTransferResponse =
+  | TransferCommittedMessage
+  | AdapterCommandFailure;
+
+type BindExpectedUserTurnResponse =
+  | BindExpectedUserTurnResult
+  | AdapterCommandFailure;
+
+type CancelTransferResponse =
+  | CancelTransferResult
+  | AdapterCommandFailure;
+
 type RelayStatusRequest = { type: "relay-status" };
 type RelayStatusResult = { type: "relay-status-result"; status: RelayStatusSnapshot };
 
@@ -554,6 +597,7 @@ type RelayPreferencesSetResult =
 
 type RelayMessage =
   | AdapterReadyMessage
+  | AdapterCommandFailure
   | AdapterInspectRequest
   | AdapterInspectResult
   | ArmResponseMessage
@@ -580,6 +624,31 @@ type RelayMessage =
   | RelayPreferencesSet
   | RelayPreferencesSetResult;
 ```
+
+`shared/errors.ts` also defines these exact non-wire errors:
+
+```ts
+class RelayDomainError extends Error {
+  readonly reason: RelayFailureReason;
+  constructor(reason: RelayFailureReason, message?: string);
+}
+
+type RelayTransportFailure = {
+  command: AdapterCommandName;
+  tabId: number;
+  sessionId?: string;
+  transferId?: string;
+  waitId?: string;
+  reason: RelayFailureReason;
+};
+
+class RelayTransportError extends Error {
+  readonly failure: RelayTransportFailure;
+  constructor(failure: RelayTransportFailure, message?: string);
+}
+```
+
+Adapter/domain code throws `RelayDomainError` for expected fail-closed reasons. Wire boundaries never serialize JavaScript `Error` objects; content runtime converts known/unknown thrown errors to `AdapterCommandFailure`, and the service-worker transport converts that wire failure to `RelayTransportError`.
 
 `maxTurns` is valid when it is an integer `>= 1`; no additional product maximum is introduced by the Plan.
 
@@ -622,6 +691,11 @@ cancel-transfer:
   request includes sessionId + transferId
   response wraps one exact CancelSubmissionResult variant
   expected = both accepted
+
+adapter-command-failure:
+  response includes command + machine-readable RelayFailureReason
+  optional sessionId/transferId/waitId correlate to the originating command
+  expected = accepted
 
 relay-status:
   request = {type:"relay-status"}
@@ -1117,6 +1191,16 @@ Conversation ownership is fixed:
 - Controller Task 10 compares prepared identity with persisted binding before authorization.
 - `commitSubmission()` compares the adapter's current conversation identity with `authorizedConversationIdentity` from the commit command and refuses to cross the submission commit point if they differ.
 
+Expected adapter failures are thrown as `RelayDomainError` with these mappings:
+- inspect/arm when the page is not ready → `adapter-not-ready`;
+- target already generating → `generation-in-progress`;
+- ambiguous/missing critical DOM contract → `dom-contract-ambiguous`;
+- commit authorized conversation differs from current → `conversation-changed`;
+- exact relay-created user turn cannot be proven → `relay-causality-ambiguous`;
+- unexpected target composer text → `unexpected-user-input`;
+- UI submission cannot be staged/committed safely → `submission-failed`.
+Unknown exceptions are not assigned a domain reason here; Task 13 content runtime maps them to `adapter-command-failed`.
+
 - [ ] **Step 1: Write RED adapter tests**
 
 Use happy-dom fixtures and fake timers.
@@ -1184,6 +1268,9 @@ git commit -m "feat: implement ChatGPT adapter lifecycle"
 
 ```ts
 interface RelayTransport {
+  // Every method resolves only with its exact success type.
+  // AdapterCommandFailure or Chrome messaging faults are converted by the
+  // Task 13 production transport into RelayTransportError.
   inspect(
     tabId: number,
     message: AdapterInspectRequest
@@ -1288,6 +1375,8 @@ class RelayController {
 7. run optional external `effect`;
 8. any continuation that later mutates state must call `withTransition()` again and revalidate.
 
+Controller code catches `RelayTransportError` only at the orchestration boundary. It persists `error` with `stopReason = error.failure.reason` unless the current operation has a more specific Design-defined reconciliation path (Task 11 cancel/commit reconciliation). A transport failure never causes blind retry.
+
 - [ ] **Step 1: Write RED start tests**
 
 Cover:
@@ -1339,6 +1428,7 @@ git commit -m "feat: start causal relay sessions"
 - Bind committed `userMessageId` before target assistant can advance the relay.
 - Increment turn only after confirmed commit.
 - Enforce `maxTurns` before creating the next `PendingTransfer`.
+- Own the normal max-turn terminal transition; maxTurns must never leave an active session stranded in a waiting state.
 
 **Interfaces:**
 - Consumes: Task 9 `RelayController` / `RelayTransport`; Task 8 adapter API.
@@ -1379,6 +1469,23 @@ The transfer ownership sequence is fixed:
 10. controller persists causedByUserMessageId and increments turn
 ```
 
+The max-turn terminal contract is exact:
+
+```text
+when a valid source assistant completion is accepted and creating the next
+transfer would make turn > maxTurns:
+  - do not create PendingTransfer
+  - do not call prepareSubmission
+  - state = "stopped"
+  - stopReason = "max-turns-reached"
+  - expectedResponse = undefined
+  - pendingTransfer = undefined
+  - preserve the current completed turn count
+  - authorize no later automatic transfer
+```
+
+This is a normal terminal state, not `error`.
+
 - [ ] **Step 1: Write RED transfer tests**
 
 Cover:
@@ -1393,7 +1500,8 @@ Cover:
 - completion that only echoes transfer ID but has wrong user ancestry is rejected;
 - target completion before commit acknowledgement/user binding is later accepted from buffer;
 - turn increments only after commit;
-- `maxTurns = 10` blocks creation of transfer 11;
+- `maxTurns = 10`: the completion that would create transfer 11 creates no `PendingTransfer`, performs no transport effect, and persists `state="stopped"` + `stopReason="max-turns-reached"`;
+- after max-turn terminal state, stale deferred prepare/commit/completion cannot restore waiting/dispatching;
 - stale wait/transfer/session event cannot advance state.
 
 - [ ] **Step 2: Run RED**
@@ -1491,11 +1599,12 @@ git add src/background/relay-controller.ts tests/background/relay-controller-sto
 git commit -m "feat: reconcile relay stop safely"
 ```
 
-### Task 12: Reload, Service-Worker Recovery, and Conversation Reconciliation
+### Task 12: Reload, Service-Worker Recovery, and Fail-Closed Lifecycle
 
 **Files:**
 - Modify: `src/background/relay-controller.ts`
 - Create: `tests/background/relay-controller-recovery.test.ts`
+- Create: `tests/background/relay-controller-lifecycle.test.ts`
 
 **Responsibilities:**
 - Reconstruct state from storage after service-worker wake.
@@ -1503,18 +1612,104 @@ git commit -m "feat: reconcile relay stop safely"
 - Reject different/unknown bound conversation.
 - Re-arm only the persisted wait, never synthesize a new wait around current DOM.
 - Reconcile committed/ambiguous transfer without blind retry.
+- Own controller semantics for paired-tab closure, invalid navigation, Split View invalidation, same-origin conversation recovery, and transcript-interference terminal transitions.
+- Keep Task 13 limited to Chrome-event/message routing.
 
 **Interfaces:**
-- Consumes: Tasks 3, 5, 8–11.
-- Produces:
-  - `recoverTab(tabId: number): Promise<RelaySession | null>`
-  - `recoverActiveSession(): Promise<RelaySession | null>`
+- Consumes: Tasks 3, 4, 5, 8–11.
+- Produces/implements these exact controller methods:
+
+```ts
+recoverTab(
+  tabId: number
+): Promise<RelaySession | null>
+
+recoverActiveSession(): Promise<RelaySession | null>
+
+handleTranscriptInterference(
+  tabId: number,
+  event: TranscriptInterferenceMessage
+): Promise<void>
+
+handleTabRemoved(
+  tabId: number
+): Promise<void>
+
+handleTabUpdated(
+  tabId: number,
+  changeInfo: { url?: string; splitViewId?: number }
+): Promise<void>
+```
+
+Terminal error normalization for this task is exact:
+
+```ts
+function terminalError(
+  current: RelaySession,
+  reason:
+    | "tab-closed"
+    | "invalid-navigation"
+    | "split-view-changed"
+    | "transcript-interference"
+    | "conversation-changed"
+    | "recovery-ambiguous"
+): RelaySession
+```
+
+`terminalError()` produces:
+- `state = "error"`;
+- `stopReason = reason`;
+- `expectedResponse = undefined`;
+- `pendingTransfer = undefined`;
+- no external submit effect;
+- next persisted `revision` through the existing `withTransition()` path.
+
+Event semantics:
+
+```text
+handleTabRemoved(tabId):
+  no active session or unrelated tab
+    -> no mutation
+  tabId == tabA || tabId == tabB
+    -> terminalError("tab-closed")
+
+handleTabUpdated(tabId, {splitViewId}):
+  unrelated tab
+    -> no mutation
+  paired tab splitViewId becomes SPLIT_VIEW_ID_NONE, undefined after a
+  reported split change, or differs from persisted session.splitViewId
+    -> terminalError("split-view-changed")
+
+handleTabUpdated(tabId, {url}):
+  unrelated tab
+    -> no mutation
+  paired tab URL leaves https://chatgpt.com/*
+    -> terminalError("invalid-navigation")
+  paired tab URL remains https://chatgpt.com/*
+    -> call recoverTab(tabId); conversation identity mismatch is resolved by
+       the existing recovery contract as "conversation-changed"
+
+handleTranscriptInterference(tabId, event):
+  require active session + sender paired tab + current sessionId + current waitId
+  stale/foreign/unrelated event
+    -> no mutation
+  exact current event
+    -> terminalError("transcript-interference")
+```
+
+Recovery semantics remain the approved Design:
+- `recoverActiveSession()` reads persisted session and performs no resend.
+- `recoverTab(tabId)` inspects only a tab belonging to the persisted pair.
+- same bound conversation + same identities may re-arm the exact persisted wait.
+- bound conversation mismatch → `conversation-changed`.
+- ambiguous identity/commit evidence → `recovery-ambiguous` or the more specific existing Design reason.
+- every recovery state mutation uses `withTransition()` and current persisted revision.
 
 - [ ] **Step 1: Write RED recovery tests**
 
 Cover:
 - same bound conversation + same accepted message → resume without re-relay;
-- different conversation after reload → error;
+- different conversation after reload → `error + conversation-changed`;
 - bound identity unavailable when needed → error;
 - new-chat unbound may bind only under first-allowed-prompt authority, not reload alone;
 - persisted wait is re-armed with same `waitId` and `causedByUserMessageId`;
@@ -1522,7 +1717,7 @@ Cover:
 - ambiguous transfer status fails closed;
 - stale worker continuation cannot overwrite newer persisted revision.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Run recovery RED**
 
 Run: `npm test -- tests/background/relay-controller-recovery.test.ts`
 
@@ -1532,39 +1727,74 @@ Expected: FAIL.
 
 No automatic resend is allowed.
 
-- [ ] **Step 4: Run GREEN**
+- [ ] **Step 4: Run recovery GREEN**
 
 Run: `npm test -- tests/background/relay-controller-recovery.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write RED lifecycle tests**
+
+In `tests/background/relay-controller-lifecycle.test.ts`, cover exactly:
+- paired tab A removed → `error + tab-closed`;
+- paired tab B removed → `error + tab-closed`;
+- unrelated tab removed → session deep-equal unchanged;
+- paired tab navigates outside `https://chatgpt.com/*` → `error + invalid-navigation`;
+- paired tab `splitViewId` becomes none/undefined-on-change/different → `error + split-view-changed`;
+- unrelated `tabs.onUpdated` evidence → no mutation;
+- current-session/current-wait `TranscriptInterferenceMessage` → `error + transcript-interference`;
+- stale sessionId/waitId or unrelated sender interference → no mutation;
+- same-origin URL update invokes recovery and different conversation identity → `error + conversation-changed`;
+- after each terminal transition, release a deferred older continuation and assert it cannot restore waiting/dispatching or create a transport effect.
+
+- [ ] **Step 6: Run lifecycle RED**
+
+Run: `npm test -- tests/background/relay-controller-lifecycle.test.ts`
+
+Expected: FAIL.
+
+- [ ] **Step 7: Implement fail-closed lifecycle handlers**
+
+Use only the existing serialized transition/revision model. Task 13 must not duplicate these state semantics.
+
+- [ ] **Step 8: Run lifecycle and recovery GREEN**
+
+Run:
 
 ```bash
-git add src/background/relay-controller.ts tests/background/relay-controller-recovery.test.ts
-git commit -m "feat: recover relay sessions safely"
+npm test -- tests/background/relay-controller-recovery.test.ts tests/background/relay-controller-lifecycle.test.ts
 ```
 
----
+Expected: PASS.
 
-### Task 13: Content-Script and Service-Worker Runtime Wiring
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/background/relay-controller.ts tests/background/relay-controller-recovery.test.ts tests/background/relay-controller-lifecycle.test.ts
+git commit -m "feat: recover and terminate relay sessions safely"
+```
+
+### Task 13: Chrome Relay Transport and Runtime Wiring
 
 **Files:**
 - Modify: `src/content/index.ts`
 - Modify: `src/background/service-worker.ts`
 - Create: `tests/integration/runtime-routing.test.ts`
+- Create: `tests/integration/chrome-relay-transport.test.ts`
 
 **Responsibilities:**
+- Implement the concrete production `RelayTransport` over `chrome.tabs.sendMessage`.
 - Instantiate one `ChatGPTAdapter` per eligible page.
-- Parse/validate every inbound extension message.
+- Dispatch every controller command to exactly one adapter method and return the exact success/failure wire type.
+- Parse/validate every inbound/outbound extension message.
 - Derive sender tab from Chrome sender metadata.
-- Route Chrome `runtime.onMessage`, `tabs.onRemoved`, and `tabs.onUpdated` events to the controller.
-- Detect Split View invalidation and same-origin conversation/navigation recovery triggers.
-- Keep authority in the controller, not runtime wrappers.
+- Route `adapter-ready`, adapter events, `tabs.onRemoved`, and `tabs.onUpdated` to the controller.
+- Invoke active-session recovery when the service worker runtime initializes.
+- Keep authoritative state semantics in the controller; runtime wrappers own transport/routing only.
 
 **Interfaces:**
 - Consumes: Tasks 2, 4, 8–12.
-- Produces exactly these runtime factories:
+- Produces exactly these production ports/factories:
 
 ```ts
 type ServiceWorkerChromeApi = {
@@ -1585,6 +1815,9 @@ interface RelayRuntimeControllerPort {
   setMaxTurns(maxTurns: number): Promise<number>;
   start(): Promise<RelaySession>;
   stop(sessionId: string): Promise<RelaySession>;
+
+  recoverTab(tabId: number): Promise<RelaySession | null>;
+  recoverActiveSession(): Promise<RelaySession | null>;
 
   handleInitialUserTurnObserved(
     tabId: number,
@@ -1627,12 +1860,17 @@ type ContentRuntimeDeps = {
 };
 
 type RuntimeHandle = {
+  ready: Promise<void>;
   dispose(): void;
 };
 
 createChromeTabsPort(
   tabs: ServiceWorkerChromeApi["tabs"]
 ): RelayTabsPort
+
+createChromeRelayTransport(
+  tabs: Pick<ServiceWorkerChromeApi["tabs"], "sendMessage">
+): RelayTransport
 
 createServiceWorkerRuntime(
   deps: ServiceWorkerRuntimeDeps
@@ -1643,55 +1881,173 @@ createContentRuntime(
 ): RuntimeHandle
 ```
 
-Runtime request/response behavior:
-- service worker receives a parsed `RelayMessage`;
-- `createChromeTabsPort().queryCurrentWindow()` calls `chrome.tabs.query({ currentWindow: true })` and maps results to Task 4 `TabSnapshot`;
-- for adapter-originated events it derives `tabId` only from `chrome.runtime.MessageSender.tab?.id`;
-- popup `relay-status` returns `RelayStatusResult`;
-- popup `relay-start` returns `RelayStartResult` after `controller.start()` and `controller.getStatus()`;
-- popup `relay-stop` returns `RelayStopResult` after validating `sessionId`, calling `controller.stop(sessionId)`, and rereading status;
-- popup preference get/set returns the exact Task 2 preference result shapes;
-- unknown/malformed messages return `undefined` and cause no controller mutation;
-- `dispose()` removes every listener installed by that factory.
+The concrete transport uses this exact algorithm for every method:
 
-- [ ] **Step 1: Write RED routing tests**
+```text
+1. send the exact request to the given tabId with chrome.tabs.sendMessage
+2. if sendMessage rejects / runtime reports no receiving end or closed channel:
+     throw RelayTransportError(reason="adapter-not-ready")
+3. parse the response with parseRelayMessage
+4. if response is AdapterCommandFailure:
+     validate command and supplied sessionId/transferId/waitId against request
+     if correlation mismatches:
+       throw RelayTransportError(reason="adapter-transport-failed")
+     else:
+       throw RelayTransportError(reason=response.reason)
+5. if parsed response type is not the exact success type for this request:
+     throw RelayTransportError(reason="adapter-transport-failed")
+6. validate request/response correlation fields:
+     arm: sessionId + waitId
+     prepare: sessionId + transferId + waitId
+     commit: sessionId + transferId + waitId
+     bind: sessionId + waitId
+     cancel: transferId
+7. any correlation mismatch:
+     throw RelayTransportError(reason="adapter-transport-failed")
+8. return exact success type
+```
 
-Cover:
-- malformed message → no controller call, response `undefined`;
-- sender-supplied/forged tab field is not authority; Chrome sender metadata is used;
-- missing sender tab for an adapter-originated event → rejected/no mutation;
-- `relay-status` request → exact `RelayStatusResult`;
-- `relay-start` request → exact `RelayStartResult`;
-- `relay-stop` request → exact `RelayStopResult`;
-- preference get/set → exact Task 2 response shapes;
-- old session/wait messages reach controller only through typed handlers and cannot mutate due to controller validation;
-- `tabs.onRemoved` invokes fail-closed handling;
-- `tabs.onUpdated(changeInfo.splitViewId)` invalidates pair when required;
-- content runtime forwards `InitialUserTurnObservedMessage`, `AssistantCompleteMessage`, and `TranscriptInterferenceMessage`;
-- no non-chatgpt content runtime path exists;
+`adapter-inspect` has no session correlation field; it accepts only `AdapterInspectResult`.
+
+Content runtime command routing is exact:
+
+```text
+AdapterInspectRequest
+  -> adapter.inspect()
+  -> AdapterInspectResult
+
+ArmResponseMessage
+  -> adapter.armExpectedResponse(message.expected)
+  -> ArmResponseResult(sessionId=expected.sessionId, waitId=expected.waitId)
+
+PreparePeerResponseMessage
+  -> adapter.prepareSubmission({
+       sessionId, transferId, waitId, text
+     })
+  -> TransferPreparedMessage using the request correlation IDs
+
+CommitTransferMessage
+  -> adapter.commitSubmission({
+       sessionId, transferId, waitId,
+       authorizationRevision, authorizedConversationIdentity
+     })
+  -> TransferCommittedMessage
+
+BindExpectedUserTurnMessage
+  -> adapter.bindExpectedUserTurn({
+       sessionId, waitId, userMessageId,
+       conversationIdentity, authorizationRevision
+     })
+  -> BindExpectedUserTurnResult
+
+CancelTransferMessage
+  -> adapter.cancelSubmission({sessionId, transferId})
+  -> CancelTransferResult
+```
+
+Content runtime failure serialization is exact:
+- known `RelayDomainError` → `AdapterCommandFailure.reason = error.reason`;
+- any other thrown/rejected adapter exception → `reason = "adapter-command-failed"`;
+- `command` always equals the request command;
+- copy only correlation fields present on the request;
+- never serialize stack/message as control data.
+
+Recovery/startup routing is exact:
+- after installing content command listeners, `createContentRuntime()` sends `{type:"adapter-ready"}`; its `ready` promise resolves when that send settles;
+- service-worker `adapter-ready` requires `sender.tab.id`; it calls `controller.recoverTab(sender.tab.id)`; unrelated tabs are ignored by controller semantics;
+- `createServiceWorkerRuntime()` immediately starts exactly one `controller.recoverActiveSession()` call and exposes it as `RuntimeHandle.ready`;
+- every state-mutating runtime event/command handler first awaits the same `ready` promise, so startup recovery cannot race ahead of or be bypassed by later runtime routing;
+- recovery methods themselves use the controller's serialized transition/revalidation boundary from Task 12.
+
+Popup routing:
+- `relay-status` → exact `RelayStatusResult`;
+- `relay-start` → call `controller.start()`, then `controller.getStatus()`, return exact `RelayStartResult`;
+- `relay-stop` → validate sessionId, call `controller.stop(sessionId)`, reread status, return exact `RelayStopResult`;
+- preference get/set → exact Task 2 result shapes.
+
+Chrome event routing:
+- `tabs.onRemoved(tabId)` → `controller.handleTabRemoved(tabId)`;
+- `tabs.onUpdated(tabId, changeInfo)` forwards only `url` and `splitViewId` into `controller.handleTabUpdated`;
+- Task 13 asserts routing only; terminal state semantics are owned/tested by Task 12.
+
+Unknown/malformed inbound messages return `undefined` and cause no controller/adapter mutation. `dispose()` removes every listener installed by its factory.
+
+- [ ] **Step 1: Write RED concrete transport tests**
+
+In `tests/integration/chrome-relay-transport.test.ts`, cover:
+- `inspect()` sends exactly `AdapterInspectRequest` and accepts only `AdapterInspectResult`;
+- `armResponse()` sends exact request and rejects wrong `sessionId` or `waitId`;
+- `prepareSubmission()` accepts only matching `TransferPreparedMessage`;
+- `commitSubmission()` rejects wrong `transferId` or `waitId`;
+- `bindExpectedUserTurn()` rejects wrong `sessionId`/`waitId`;
+- `cancelSubmission()` accepts only matching `CancelTransferResult.result.transferId`;
+- an `AdapterCommandFailure` with matching correlation becomes `RelayTransportError` preserving its `reason`;
+- `sendMessage` rejection/no receiver/channel-closed maps to `adapter-not-ready`;
+- malformed/unparseable response maps to `adapter-transport-failed`;
+- unexpected response type maps to `adapter-transport-failed`;
+- response correlation mismatch maps to `adapter-transport-failed`.
+
+- [ ] **Step 2: Run transport RED**
+
+Run: `npm test -- tests/integration/chrome-relay-transport.test.ts`
+
+Expected: FAIL.
+
+- [ ] **Step 3: Implement `createChromeRelayTransport()`**
+
+Use only `chrome.tabs.sendMessage`, Task 2 parsing, and the exact failure mapping above. Do not retry.
+
+- [ ] **Step 4: Run transport GREEN**
+
+Run: `npm test -- tests/integration/chrome-relay-transport.test.ts`
+
+Expected: PASS.
+
+- [ ] **Step 5: Write RED runtime routing tests**
+
+In `tests/integration/runtime-routing.test.ts`, cover:
+- malformed message → no controller/adapter call, response `undefined`;
+- every six controller command request types invoke exactly the adapter method in the routing table and return its exact success type;
+- known `RelayDomainError` from each command becomes correlated `AdapterCommandFailure`;
+- unknown adapter exception becomes `adapter-command-failed`;
+- content runtime startup emits exactly one `adapter-ready`;
+- `adapter-ready` from paired persisted tab routes to `recoverTab(senderTabId)`;
+- `adapter-ready` from unrelated tab reaches `recoverTab` but produces no active-session mutation in the Task 12 semantic test seam;
+- service-worker factory invokes `recoverActiveSession()` exactly once;
+- state-mutating handler waits for runtime `ready` before controller invocation;
+- sender-supplied/forged tab data is not authority; Chrome sender metadata is used;
+- missing sender tab for adapter-originated events → rejected/no mutation;
+- `InitialUserTurnObservedMessage`, `AssistantCompleteMessage`, and `TranscriptInterferenceMessage` route with sender tabId;
+- popup status/start/stop/preferences return exact Task 2 result shapes;
+- `tabs.onRemoved` routes only to `handleTabRemoved`;
+- `tabs.onUpdated` routes only to `handleTabUpdated`;
 - `dispose()` removes listeners.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 6: Run runtime RED**
 
 Run: `npm test -- tests/integration/runtime-routing.test.ts`
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement service-worker and content runtime factories**
+- [ ] **Step 7: Implement content/service-worker runtime factories**
 
-Do not put selectors or state-machine mutations in the wrappers.
+Do not put selectors or state-machine terminal semantics in runtime wrappers.
 
-- [ ] **Step 4: Run GREEN**
+- [ ] **Step 8: Run runtime GREEN**
 
-Run: `npm test -- tests/integration/runtime-routing.test.ts`
+Run:
+
+```bash
+npm test -- tests/integration/chrome-relay-transport.test.ts tests/integration/runtime-routing.test.ts
+```
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src/background/service-worker.ts src/content/index.ts tests/integration/runtime-routing.test.ts
-git commit -m "feat: wire Chrome relay runtimes"
+git add src/background/service-worker.ts src/content/index.ts tests/integration/chrome-relay-transport.test.ts tests/integration/runtime-routing.test.ts
+git commit -m "feat: wire Chrome relay transport and runtimes"
 ```
 
 ### Task 14: Popup Start/Stop/maxTurns/Status Surface
@@ -1821,7 +2177,7 @@ Before implementing browser suspension coverage, confirm these deterministic own
 - Task 3: queued operation + revision/session validation.
 - Task 10: deferred external operation returns after persisted revision has advanced; old continuation re-enters and is rejected.
 - Task 11: Stop advances to `stopping/stopped/error`, then deferred older ACK/completion is released and cannot overwrite state.
-- Task 12: recovery/wake reads newest persisted revision and rejects stale continuation.
+- Task 12: recovery/lifecycle reads newest persisted revision and rejects stale continuation; terminal lifecycle tests release deferred older work after error transitions.
 
 No browser timing is required to prove these races.
 
@@ -1969,5 +2325,7 @@ Before claiming implementation complete:
 7. Confirm no relay state is owned by popup code or module-global service-worker variables.
 8. Confirm no automatic retry exists for ambiguous committed submissions.
 9. Confirm no implementation widened the Design-approved browser/security/protocol boundaries.
+10. Confirm every declared controller production method has a RED/GREEN semantic owner, and Task 13 tests only route Chrome events/messages into those methods.
+11. Confirm active-session terminal reasons `tab-closed`, `invalid-navigation`, `split-view-changed`, `transcript-interference`, and `max-turns-reached` are exercised by controller tests.
 
 If any approved Design invariant cannot be implemented against the current ChatGPT DOM, stop and return to Design Review instead of inventing a weaker protocol.
