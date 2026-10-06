@@ -368,8 +368,29 @@ type CancelSubmissionResult =
   | { status: "unknown"; transferId: string };
 ```
 
-`RelayFailureReason` must include at least the Design reasons used by controller/popup:
-`"pair-invalid"`, `"conversation-changed"`, `"relay-causality-ambiguous"`, `"message-identity-ambiguous"`, `"transcript-interference"`, `"unexpected-user-input"`, `"submission-failed"`, `"split-view-changed"`, `"tab-closed"`, `"invalid-navigation"`, `"max-turns-reached"`, and `"stopped-by-user"`.
+`RelayFailureReason` is the exact union:
+
+```ts
+type RelayFailureReason =
+  | "pair-invalid"
+  | "adapter-not-ready"
+  | "generation-in-progress"
+  | "dom-contract-ambiguous"
+  | "conversation-changed"
+  | "relay-causality-ambiguous"
+  | "message-identity-ambiguous"
+  | "transcript-interference"
+  | "unexpected-user-input"
+  | "submission-failed"
+  | "split-view-changed"
+  | "tab-closed"
+  | "invalid-navigation"
+  | "recovery-ambiguous"
+  | "max-turns-reached"
+  | "stopped-by-user";
+```
+
+Later tasks must not invent additional machine-readable failure strings without updating this Plan through review.
 
 Popup status is fixed as:
 
@@ -626,6 +647,8 @@ unknown type / extra incompatible field type:
 
 Compile-time fixtures must instantiate the exact Design fields:
 `conversationA`, `conversationB`, `revision`, `expectedResponse`, `pendingTransfer`, `causedByUserMessageId`, and `targetUserMessageId`.
+
+Add a table-driven validator test containing one valid fixture and one missing/wrong-required-field fixture for **every** `RelayMessage` union member listed above. No union member may be added later without a corresponding validator fixture.
 
 - [ ] **Step 2: Run RED**
 
