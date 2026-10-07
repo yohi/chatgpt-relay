@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChatGPT Relay Browser Fixture</title>
+  </head>
+  <body>
+    <main id="main-thread">
+      <section id="transcript">
+        <article
+          id="fixture-user-turn"
+          data-chatgpt-search-unit-key="fallback-turn-0:0:user"
+          data-chatgpt-search-message-ids="11111111-1111-4111-8111-111111111111"
+        >
+          <div data-user-message-bubble>synthetic user fixture</div>
+          <button id="fixture-edit-control" aria-label="メッセージを編集"></button>
+        </article>
+        <article
+          id="fixture-assistant-turn"
+          data-chatgpt-search-unit-key="fallback-turn-0:2:assistant"
+          data-chatgpt-search-message-ids="22222222-2222-4222-8222-222222222222 22222222-2222-4222-8222-222222222222"
+          data-chatgpt-selection-message-id="22222222-2222-4222-8222-222222222222"
+        >
+          <h4 data-conversation-role="assistant">synthetic assistant fixture</h4>
+          <button id="fixture-regenerate-control" aria-label="回答を再生成"></button>
+        </article>
+      </section>
+      <form id="fixture-composer" data-chatgpt-composer>
+        <div
+          id="fixture-textbox"
+          role="textbox"
+          contenteditable="true"
+          data-composer-markdown
+          aria-label="ChatGPT composer fixture"
+        ></div>
+        <button id="fixture-send" type="submit">Send</button>
+      </form>
+    </main>
+    <script src="./chat-page.js"></script>
+  </body>
+</html>

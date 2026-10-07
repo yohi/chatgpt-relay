@@ -9,7 +9,8 @@
   "packageManager": "npm@11.19.0",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "vitest run",
+    "test": "vitest run --exclude tests/integration/extension-browser.spec.ts",
+    "test:browser": "playwright test",
     "test:unit": "vitest run tests/background tests/content tests/shared",
     "test:integration": "vitest run tests/integration"
   },
