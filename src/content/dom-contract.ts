@@ -78,8 +78,9 @@ function resolveMainThread(document: Document): MainThread {
 
 function readConversationIdentity(document: Document, transcriptLength: number): string | null {
   const pathname = document.location.pathname
-  if (pathname === "/" && transcriptLength === 0) return null
-  if (pathname === "/" || pathname === "") failClosed("dom-contract-ambiguous")
+  const observedNewChatPathname = pathname === "/" || pathname === "/ja-JP/"
+  if (observedNewChatPathname && transcriptLength === 0) return null
+  if (observedNewChatPathname || pathname === "") failClosed("dom-contract-ambiguous")
 
   const match = /^\/c\/([^/]+)\/?$/.exec(pathname)
   const conversationIdentity = match?.[1]

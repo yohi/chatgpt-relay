@@ -26,6 +26,22 @@ describe("ChatGPT DOM contract", () => {
     expect(inspection.composer.id).toBe("main-textbox")
   })
 
+  it("treats the observed ja-JP localized new-chat route as unbound", async () => {
+    const page = await loadFixture("new-chat.html", "/ja-JP/")
+    const inspection = inspectChatGptDom(page)
+
+    expect(inspection.conversationIdentity).toBeNull()
+    expect(inspection.transcript).toEqual([])
+  })
+
+  it("rejects a committed transcript on the localized unbound route", async () => {
+    const page = await loadFixture("idle-existing.html", "/ja-JP/")
+
+    expect(() => inspectChatGptDom(page)).toThrow(
+      new RelayDomainError("dom-contract-ambiguous"),
+    )
+  })
+
   it("extracts stable conversation identity from a committed thread pathname", async () => {
     const page = await loadFixture("idle-existing.html", "/c/conversation-123")
 
