@@ -169,6 +169,16 @@ export function findSubmitControl(document: Document): HTMLElement {
   return submitControl
 }
 
+export function isMainComposerSubmission(
+  document: Document,
+  eventTarget: EventTarget | null,
+): boolean {
+  const view = document.defaultView
+  if (view === null || !(eventTarget instanceof view.HTMLFormElement)) return false
+  const { composer } = resolveMainThread(document)
+  return eventTarget === composer
+}
+
 export function classifyTranscriptMutationControl(
   document: Document,
   eventTarget: EventTarget | null,

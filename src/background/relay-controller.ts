@@ -82,6 +82,19 @@ function isActiveState(session: RelaySession): boolean {
   )
 }
 
+function isAwaitingInitialUnboundA(session: RelaySession, tabId: number): boolean {
+  const expected = session.expectedResponse
+  return (
+    session.state === "waiting-a" &&
+    tabId === session.tabA &&
+    session.conversationA.state === "unbound" &&
+    expected?.side === "a" &&
+    expected.causedByTransferId === undefined &&
+    expected.causedByUserMessageId === undefined &&
+    session.pendingTransfer === undefined
+  )
+}
+
 function terminalFailure(session: RelaySession, reason: RelayFailureReason): RelaySession {
   const { expectedResponse: _expectedResponse, pendingTransfer: _pendingTransfer, ...retained } = session
   return {
@@ -490,6 +503,7 @@ export class RelayController {
       await this.terminalize(current, "invalid-navigation")
       return
     }
+    if (isAwaitingInitialUnboundA(current, tabId)) return
     await this.recoverTab(tabId)
   }
 

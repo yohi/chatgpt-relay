@@ -18,6 +18,7 @@ import {
   classifyTranscriptMutationControl,
   findSubmitControl,
   inspectChatGptDom,
+  isMainComposerSubmission,
   readTranscript,
 } from "./dom-contract"
 import type { TranscriptEntry } from "./dom-contract"
@@ -62,6 +63,18 @@ type CommitInput = {
 
 function transferKey(sessionId: string, transferId: string): string {
   return `${sessionId}:${transferId}`
+}
+
+function isInitialManualAWait(expected: ExpectedResponse): boolean {
+  return (
+    expected.side === "a" &&
+    expected.causedByTransferId === undefined &&
+    expected.causedByUserMessageId === undefined
+  )
+}
+
+function isObservedNewChatPathname(pathname: string): boolean {
+  return pathname === "/" || pathname === "/ja-JP/"
 }
 
 function toTranscriptIdentity(entry: TranscriptEntry): TranscriptMessageIdentity {
@@ -109,12 +122,15 @@ export class ChatGPTAdapter {
   private boundUserMessageId: string | null = null
   private baselineMessageIds = new Set<string>()
   private initialUserTurnEmitted = false
+  private initialManualSubmissionObserved = false
+  private armedConversationIdentity: string | null = null
   private emittedCompletion = false
   private eventHandler: ((event: AdapterEvent) => void) | null = null
   private pendingEvents: AdapterEvent[] = []
   private mutationObserver: MutationObserver | null = null
   private completionTimer: number | null = null
   private mutationClickListener: ((event: Event) => void) | null = null
+  private mainSubmitListener: ((event: Event) => void) | null = null
   private emittedInterference = false
 
   constructor(private readonly pageDocument: Document) {}
@@ -147,6 +163,8 @@ export class ChatGPTAdapter {
     this.expected = expected
     this.boundUserMessageId = expected.causedByUserMessageId ?? null
     this.initialUserTurnEmitted = false
+    this.initialManualSubmissionObserved = false
+    this.armedConversationIdentity = inspection.conversationIdentity
     this.emittedCompletion = false
     this.emittedInterference = false
     this.baselineMessageIds = new Set(
@@ -321,7 +339,20 @@ export class ChatGPTAdapter {
       const mutation = classifyTranscriptMutationControl(this.pageDocument, event.target)
       if (mutation !== null) this.emitInterference(expected, mutation)
     }
+    this.mainSubmitListener = (event) => {
+      const expected = this.expected
+      if (expected === null || !isInitialManualAWait(expected)) return
+      try {
+        if (isMainComposerSubmission(this.pageDocument, event.target)) {
+          this.initialManualSubmissionObserved = true
+        }
+      } catch (error) {
+        if (!(error instanceof RelayDomainError)) throw error
+        this.emitInterference(expected, "causality-ambiguous")
+      }
+    }
     this.pageDocument.addEventListener("click", this.mutationClickListener, true)
+    this.pageDocument.addEventListener("submit", this.mainSubmitListener, true)
     this.mutationObserver.observe(this.pageDocument.body, {
       attributes: true,
       characterData: true,
@@ -344,23 +375,32 @@ export class ChatGPTAdapter {
       if (!(error instanceof RelayDomainError)) throw error
       if (
         error.reason === "dom-contract-ambiguous" &&
-        this.pageDocument.location.pathname === "/" &&
-        expected.causedByTransferId === undefined
+        isObservedNewChatPathname(this.pageDocument.location.pathname) &&
+        isInitialManualAWait(expected)
       ) {
+        if (this.initialManualSubmissionObserved) return
+        this.emitInterference(expected, "causality-ambiguous")
         return
       }
       this.emitInterference(expected, "causality-ambiguous")
       return
     }
 
-    if (
-      expected.causedByTransferId === undefined &&
-      expected.causedByUserMessageId === undefined &&
-      !this.initialUserTurnEmitted
-    ) {
+    if (isInitialManualAWait(expected) && !this.initialUserTurnEmitted) {
       const newUsers = transcript.filter(
         (entry) => entry.role === "user" && entry.stableDomId !== null && !this.baselineMessageIds.has(entry.stableDomId),
       )
+      if (
+        !this.initialManualSubmissionObserved &&
+        ((this.armedConversationIdentity === null && inspection.conversationIdentity !== null) ||
+          newUsers.length > 0)
+      ) {
+        this.emitInterference(
+          expected,
+          newUsers.length > 0 ? "unexpected-user-turn" : "causality-ambiguous",
+        )
+        return
+      }
       if (newUsers.length > 1) {
         this.emitInterference(expected, "unexpected-user-turn")
       } else if (newUsers.length === 1 && inspection.conversationIdentity !== null) {
@@ -447,6 +487,10 @@ export class ChatGPTAdapter {
       this.pageDocument.removeEventListener("click", this.mutationClickListener, true)
     }
     this.mutationClickListener = null
+    if (this.mainSubmitListener !== null) {
+      this.pageDocument.removeEventListener("submit", this.mainSubmitListener, true)
+    }
+    this.mainSubmitListener = null
     if (this.completionTimer !== null) this.pageDocument.defaultView?.clearTimeout(this.completionTimer)
     this.completionTimer = null
     this.eventHandler = null

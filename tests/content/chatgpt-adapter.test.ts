@@ -33,10 +33,28 @@ async function loadExistingConversation(): Promise<Document> {
   return document
 }
 
+async function loadNewChat(): Promise<Document> {
+  const html = await readFile(resolve(process.cwd(), "tests/content/fixtures/new-chat.html"), "utf8")
+  document.body.innerHTML = html
+  window.history.replaceState(null, "", "/ja-JP/")
+  return document
+}
+
 function textbox(): HTMLElement {
   const element = document.getElementById("main-textbox")
   if (!(element instanceof HTMLElement)) throw new Error("missing synthetic composer")
   return element
+}
+
+function appendInitialUserTurn(messageId: string): void {
+  const article = document.createElement("article")
+  article.setAttribute("data-chatgpt-search-unit-key", "fallback-turn-0:0:user")
+  article.setAttribute("data-chatgpt-search-message-ids", messageId)
+  const bubble = document.createElement("div")
+  bubble.setAttribute("data-user-message-bubble", "")
+  bubble.textContent = "synthetic initial user prompt"
+  article.append(bubble)
+  document.getElementById("main-thread")?.append(article)
 }
 
 function installUserTurnOnSubmit(userMessageId = "77777777-7777-4777-8777-777777777777"): {
@@ -83,6 +101,88 @@ describe("ChatGPTAdapter", () => {
         messageId: "22222222-2222-4222-8222-222222222222",
       },
     })
+  })
+
+  it("binds the initial user only after a main composer submission and localized route commit", async () => {
+    const page = await loadNewChat()
+    const adapter = new ChatGPTAdapter(page)
+    await adapter.armExpectedResponse({
+      sessionId: "session-initial-a",
+      waitId: "initial-a-wait",
+      side: "a",
+      tabId: 11,
+      baselineMessageId: null,
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+    const composer = document.getElementById("main-composer")
+    if (!(composer instanceof HTMLFormElement)) throw new Error("missing main composer fixture")
+    textbox().textContent = "synthetic approved initial prompt"
+    composer.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }))
+    appendInitialUserTurn("15151515-1515-4151-8151-151515151515")
+    await Promise.resolve()
+
+    expect(received.some((event) => event.type === "initial-user-turn-observed")).toBe(false)
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(false)
+
+    window.history.replaceState(null, "", "/c/first-allowed-conversation")
+    const routeChange = document.createElement("span")
+    document.getElementById("main-thread")?.append(routeChange)
+    await Promise.resolve()
+
+    expect(received).toContainEqual({
+      type: "initial-user-turn-observed",
+      sessionId: "session-initial-a",
+      waitId: "initial-a-wait",
+      userMessageId: "15151515-1515-4151-8151-151515151515",
+      conversationIdentity: "first-allowed-conversation",
+    })
+    dispose()
+  })
+
+  it("fails closed instead of adopting an unrelated one-turn navigation without submit evidence", async () => {
+    const page = await loadNewChat()
+    const adapter = new ChatGPTAdapter(page)
+    await adapter.armExpectedResponse({
+      sessionId: "session-initial-a",
+      waitId: "initial-a-wait",
+      side: "a",
+      tabId: 11,
+      baselineMessageId: null,
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+    window.history.replaceState(null, "", "/c/unrelated-conversation")
+    appendInitialUserTurn("16161616-1616-4161-8161-161616161616")
+    await Promise.resolve()
+
+    expect(received.some((event) => event.type === "initial-user-turn-observed")).toBe(false)
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(true)
+    dispose()
+  })
+
+  it("does not treat Quick Chat submit as the allowed initial A prompt", async () => {
+    const page = await loadNewChat()
+    const adapter = new ChatGPTAdapter(page)
+    await adapter.armExpectedResponse({
+      sessionId: "session-initial-a",
+      waitId: "initial-a-wait",
+      side: "a",
+      tabId: 11,
+      baselineMessageId: null,
+    })
+    const received: AdapterEvent[] = []
+    const dispose = adapter.startObserving((event) => received.push(event))
+    const quickChat = document.getElementById("quick-chat-composer")
+    if (!(quickChat instanceof HTMLFormElement)) throw new Error("missing Quick Chat fixture")
+    quickChat.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }))
+    window.history.replaceState(null, "", "/c/unrelated-conversation")
+    appendInitialUserTurn("17171717-1717-4171-8171-171717171717")
+    await Promise.resolve()
+
+    expect(received.some((event) => event.type === "initial-user-turn-observed")).toBe(false)
+    expect(received.some((event) => event.type === "transcript-interference")).toBe(true)
+    dispose()
   })
 
   it("prepares the observed conversation and stages without submitting", async () => {

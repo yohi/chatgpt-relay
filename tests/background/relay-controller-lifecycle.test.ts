@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import type { RelaySession } from "../../src/shared/domain"
+import type { AdapterSnapshot, RelaySession } from "../../src/shared/domain"
 import { RelayController } from "../../src/background/relay-controller"
 import type { RelayTransport } from "../../src/background/relay-controller"
 import type { RelayPreferencesStore, RelaySessionStore } from "../../src/background/session-store"
@@ -49,8 +49,17 @@ function activeSession(): RelaySession {
   }
 }
 
-function createHarness(options: { readonly identityB?: string | null; readonly deferInspect?: boolean } = {}) {
-  let stored: RelaySession = activeSession()
+type LifecycleHarnessOptions = {
+  readonly identityA?: string | null
+  readonly identityB?: string | null
+  readonly deferInspect?: boolean
+  readonly initialSession?: RelaySession
+  readonly latestUserA?: AdapterSnapshot["latestUser"]
+}
+
+function createHarness(options: LifecycleHarnessOptions = {}) {
+  let stored = options.initialSession ?? activeSession()
+  const identityA = "identityA" in options ? options.identityA ?? null : "conversation-a"
   let identityB = "identityB" in options ? options.identityB ?? null : "conversation-b"
   let holdInspect = options.deferInspect ?? false
   let releaseInspect: (() => void) | undefined
@@ -80,8 +89,10 @@ function createHarness(options: { readonly identityB?: string | null; readonly d
         snapshot: {
           ready: true,
           generating: false,
-          conversationIdentity: tabId === 11 ? "conversation-a" : identityB,
-          latestUser: { messageId: "user-b-1", role: "user", textHash: "user-hash" },
+          conversationIdentity: tabId === 11 ? identityA : identityB,
+          latestUser: tabId === 11
+            ? options.latestUserA ?? { messageId: "user-a-1", role: "user", textHash: "user-a-hash" }
+            : { messageId: "user-b-1", role: "user", textHash: "user-hash" },
           latestAssistant: { messageId: "assistant-b-before", text: "prior", textHash: "prior-hash" },
         },
       }
@@ -145,6 +156,84 @@ function updateWithUndefinedSplitId(): { splitViewId?: number } {
 }
 
 describe("RelayController lifecycle failures", () => {
+  it("allows exact first-user-turn evidence to bind an initially unbound A after route update", async () => {
+    const active = activeSession()
+    const { pendingTransfer: _pendingTransfer, ...retained } = active
+    const initial: RelaySession = {
+      ...retained,
+      revision: 1,
+      state: "waiting-a",
+      conversationA: { state: "unbound" },
+      expectedResponse: {
+        sessionId: active.id,
+        waitId: "initial-a-wait",
+        side: "a",
+        tabId: active.tabA,
+        baselineMessageId: null,
+      },
+    }
+    const harness = createHarness({
+      initialSession: initial,
+      identityA: "conversation-created-by-prompt",
+      latestUserA: { messageId: "user-first-prompt", role: "user", textHash: "prompt-hash" },
+    })
+
+    await harness.controller.handleTabUpdated(11, { url: "https://chatgpt.com/c/conversation-created-by-prompt" })
+
+    expect(harness.current()).toEqual(initial)
+    expect(harness.calls).toEqual([])
+
+    await harness.controller.handleInitialUserTurnObserved(11, {
+      type: "initial-user-turn-observed",
+      sessionId: active.id,
+      waitId: "initial-a-wait",
+      userMessageId: "user-first-prompt",
+      conversationIdentity: "conversation-created-by-prompt",
+    })
+
+    expect(harness.current()).toMatchObject({
+      state: "waiting-a",
+      conversationA: { state: "bound", conversationIdentity: "conversation-created-by-prompt" },
+      expectedResponse: { waitId: "initial-a-wait", causedByUserMessageId: "user-first-prompt" },
+    })
+  })
+
+  it("revalidates normally when the exact initial user event arrives before the route update", async () => {
+    const active = activeSession()
+    const { pendingTransfer: _pendingTransfer, ...retained } = active
+    const initial: RelaySession = {
+      ...retained,
+      revision: 1,
+      state: "waiting-a",
+      conversationA: { state: "unbound" },
+      expectedResponse: {
+        sessionId: active.id,
+        waitId: "initial-a-wait",
+        side: "a",
+        tabId: active.tabA,
+        baselineMessageId: null,
+      },
+    }
+    const harness = createHarness({
+      initialSession: initial,
+      identityA: "conversation-created-by-prompt",
+      latestUserA: { messageId: "user-first-prompt", role: "user", textHash: "prompt-hash" },
+    })
+    await harness.controller.handleInitialUserTurnObserved(11, {
+      type: "initial-user-turn-observed",
+      sessionId: active.id,
+      waitId: "initial-a-wait",
+      userMessageId: "user-first-prompt",
+      conversationIdentity: "conversation-created-by-prompt",
+    })
+    const bound = harness.current()
+
+    await harness.controller.handleTabUpdated(11, { url: "https://chatgpt.com/c/conversation-created-by-prompt" })
+
+    expect(harness.current()).toEqual(bound)
+    expect(harness.calls).toContain("arm-11")
+  })
+
   it.each([11, 12])("fails closed when paired tab %i is removed", async (tabId) => {
     const harness = createHarness()
 
