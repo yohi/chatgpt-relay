@@ -2303,7 +2303,7 @@ git commit -m "feat: add relay control popup"
 
 ---
 
-### Task 15: Browser Integration Harness and MV3 Idle/Restart Persistence
+### Task 15: Browser Integration Harness and Deterministic MV3 Restart Persistence
 
 **Files:**
 - Create: `playwright.config.ts`
@@ -2316,17 +2316,17 @@ git commit -m "feat: add relay control popup"
 **Responsibilities:**
 - Load `dist/` as an unpacked extension in bundled Playwright Chromium.
 - Exercise runtime wiring against deterministic ChatGPT-like fixture pages served under `https://chatgpt.com/__relay-test/*` via request interception, without changing production host permissions.
-- Browser-test the Design requirement that `chrome.storage.session` survives a natural MV3 idle suspension/restart.
-- Do **not** use an exact-suspension-instant race as a gating test; stale async continuation correctness remains deterministic unit/integration coverage in Tasks 3, 10, 11, and 12.
+- Browser-test the Design requirement that an actual MV3 service-worker execution-context restart does not lose authoritative relay state in `chrome.storage.session`.
+- Trigger the browser worker's stop/start lifecycle deterministically through Playwright 1.63.0's CDP `ServiceWorker` domain; this is test-harness-only and does not alter production behavior.
+- Stale async continuation correctness remains deterministic unit/integration coverage in Tasks 3, 10, 11, and 12; do **not** race an in-flight evaluation against worker stop.
 - Keep real native Split View and real account behavior as Task 16 manual smoke.
 
 **Interfaces:**
 - Consumes: all prior tasks.
 - Produces:
   - npm script `test:browser`.
-  - `MV3_IDLE_WAIT_MS = 35_000`.
-  - Playwright test timeout for the idle/restart case: `90_000` ms.
-  - one persistent-context extension fixture exposing `context`, `extensionId`, and the original service worker; the MV3 idle/restart test must reuse the same Playwright `Worker` handle.
+  - Playwright test timeout for the deterministic stop/restart case: `90_000` ms.
+  - one persistent-context extension fixture exposing `context`, `extensionId`, and the original service worker; the MV3 stop/restart test must reuse the same Playwright `Worker` handle.
 
 - [ ] **Step 1: Write RED browser tests**
 
@@ -2349,31 +2349,58 @@ popup:
   chrome-extension://<id>/popup.html
   relay-status round-trip returns exact RelayStatusResult
 
-MV3 idle/restart persistence:
+MV3 service-worker stop/restart persistence:
   1. get the service worker handle sw from context.serviceWorkers()
      or waitForEvent("serviceworker")
-  2. through sw.evaluate(), write a known RelaySession fixture to
-     chrome.storage.session and set globalThis.__relayLifetimeMarker = "before-idle"
-  3. perform no extension API calls/events for MV3_IDLE_WAIT_MS = 35_000 ms
-     (Chrome documents normal termination after ~30 seconds inactivity)
-  4. do NOT wait for a new "serviceworker" event
-  5. call evaluate() again on the same Playwright Worker handle
-  6. assert the worker-global lifetime marker is absent/reset, proving a new
-     execution context was created
-  7. read chrome.storage.session in that resumed evaluation
-  8. assert the known RelaySession fixture is unchanged
+  2. through sw.evaluate(), write a known RelaySession fixture containing its
+     persisted ExpectedResponse and PendingTransfer to
+     chrome.storage.session key "activeRelaySession" and set
+     globalThis.__relayLifetimeMarker = "before-restart"
+  3. create a normal Playwright page and CDP session; enable the CDP
+     "ServiceWorker" domain and observe workerRegistrationUpdated /
+     workerVersionUpdated for the exact extension scopeURL/scriptURL
+  4. resolve the target extension worker's scopeURL and versionId; fail closed
+     if the target is absent or ambiguous
+  5. install a workerVersionUpdated listener, call
+     ServiceWorker.stopWorker({ versionId }), and await that exact version's
+     runningStatus="stopped"
+  6. install a running-state listener, call
+     ServiceWorker.startWorker({ scopeURL }), and await the exact extension
+     worker's runningStatus="running"
+  7. do NOT wait for a new "serviceworker" event or reacquire a Worker object;
+     assert expect(context.serviceWorkers()).toContain(sw). When the isolated
+     fixture has exactly one extension worker, also assert
+     expect(context.serviceWorkers()).toStrictEqual([sw])
+  8. call evaluate() on the same Playwright Worker handle; assert the
+     worker-global marker is absent/reset and chrome.storage.session contains
+     the exact unchanged RelaySession fixture
+  9. use the normal post-restart runtime/status path to prove the persisted
+     session is still recoverable; no transfer is submitted or re-authorized
 
 transcript interference routing:
   real runtime message path reaches fail-closed controller handling
 ```
 
-The idle/restart test uses `test.setTimeout(90_000)`.
+The deterministic stop/start test uses `test.setTimeout(90_000)`. Its timeout
+is only a bound for the observed worker-version state transitions; it does not
+wait for a naturally scheduled idle interval.
 
-The browser suite must **not** attempt to collide an already in-flight `evaluate()` with the exact suspension instant and must not gate on receiving a new service-worker event. Playwright keeps the same `Worker` handle across MV3 restart.
+The browser suite must not use a natural 30–35 second idle interval as a
+correctness gate, must not collide an in-flight `evaluate()` with worker stop,
+and must not gate on receiving a new service-worker event. Playwright 1.63.0
+keeps the same `Worker` handle across the tested MV3 stop/start lifecycle; assert
+that the original object remains the sole Worker for this extension.
+
+Natural idle duration is browser scheduling behavior, not a Design invariant,
+and is not deterministic enough to be a CI correctness gate in the observed
+bundled Chromium environment. The Design requires restart correctness, not a
+particular timing mechanism. The CDP stop/start operation is an actual browser
+service-worker lifecycle transition, not a mocked controller or in-process
+simulation. CDP use is confined to this Playwright test harness.
 
 - [ ] **Step 2: Keep stale-continuation race ownership deterministic**
 
-Before implementing browser suspension coverage, confirm these deterministic owners remain present:
+Before implementing browser restart coverage, confirm these deterministic owners remain present:
 - Task 3: queued operation + revision/session validation.
 - Task 10: deferred external operation returns after persisted revision has advanced; old continuation re-enters and is rejected.
 - Task 11: Stop advances to `stopping/stopped/error`, then deferred older ACK/completion is released and cannot overwrite state.
@@ -2396,10 +2423,21 @@ Use the documented setup:
 - `--disable-extensions-except=<dist>`
 - `--load-extension=<dist>`
 - retrieve the MV3 service worker once with `context.serviceWorkers()` / `waitForEvent("serviceworker")`;
-- retain that same `Worker` object for the natural idle/restart persistence test;
+- retain that same `Worker` object for the deterministic stop/start persistence test;
 - intercept `https://chatgpt.com/__relay-test/**` and fulfill from the local harness.
 
-Do not add remote test services, test-only permissions, alarms, debugger hooks, keep-alive pings, or other mechanisms that change the production worker lifetime.
+Create a normal Playwright page only to obtain a CDP session. Subscribe to
+`ServiceWorker.workerRegistrationUpdated` and
+`ServiceWorker.workerVersionUpdated`, identify the extension worker by its
+exact scopeURL/scriptURL, and use `ServiceWorker.stopWorker` followed by
+`ServiceWorker.startWorker` with event-based runningStatus waits. Detach the
+CDP session and close its temporary page during fixture teardown. Verify no
+other extension worker can be mistaken for the target.
+
+Do not add remote test services, test-only permissions, alarms, production
+debugger hooks, keep-alive pings, forced production behavior, or other
+mechanisms that change the production worker lifetime. Do not depend on an
+exact natural idle duration.
 
 - [ ] **Step 5: Run GREEN**
 
@@ -2412,8 +2450,10 @@ npm run test:browser
 
 Expected:
 - all browser tests PASS;
-- the natural idle/restart test confirms global execution state resets while `chrome.storage.session` persists;
-- no exact-suspension-instant test exists.
+- the actual CDP-stopped/restarted worker has a fresh global execution context;
+- the original Playwright `Worker` object remains the same object;
+- the exact known `RelaySession` in `chrome.storage.session` persists and can be recovered;
+- no natural-idle timeout or exact-suspension-instant test exists.
 
 - [ ] **Step 6: Commit**
 
